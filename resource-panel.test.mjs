@@ -193,6 +193,22 @@ test('window statistics use observed finite samples only and show unknown for no
   assert.ok(!/[\u2801-\u28ff]/u.test(text));
 });
 
+test('layout caches are render-local so changed samples and expired windows are never reused', () => {
+  const samples = [25, 50];
+  const sampled = { now, times: [now - 1000, now], windowSeconds: 80, sections: [{ title: '资源', metrics: [
+    { label: 'CPU', value: '50%', values: samples },
+  ] }] };
+  const options = { width: 48, height: 20 };
+  const first = renderResourcePanel(sampled, options).join('\n');
+  assert.ok(first.includes('min 25 · max 50 · avg 38'));
+  samples[1] = 100;
+  const updated = renderResourcePanel(sampled, options).join('\n');
+  assert.ok(updated.includes('min 25 · max 100 · avg 63'));
+  const expired = renderResourcePanel({ ...sampled, now: now + 81_000 }, options).join('\n');
+  assert.ok(expired.includes('min — · max — · avg —'));
+  assert.ok(!/[\u2801-\u28ff]/u.test(expired));
+});
+
 test('tiny widths/heights and graph axes never exceed their visible budgets', () => {
   for (const width of [0, 1, 2, 4, 10, 15, 16, 32, 78, 108]) {
     for (const height of [0, 1, 2, 3, 4, 5, 6, 8, 22, 66]) {

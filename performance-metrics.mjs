@@ -84,12 +84,27 @@ export function readPerformanceMetrics({ threadIds = [], dbPath = defaultPerform
     if (!compatible(db)) return empty();
     const result = { ...empty(), available: true };
     const projection = 'field,value,measured_at,source,approximate,lower_bound,observed_since,observed_responses';
-    // This source contains only numeric snapshots. Read bounded known fields
-    // for freshness without projecting any unrelated thread identifiers.
-    for (const field of FIELDS) {
-      const latest = db.prepare(`SELECT ${projection} FROM thread_metric_values WHERE field=? AND measured_at<=? ORDER BY measured_at DESC LIMIT 1`).get(field, checkedAt);
-      const clean = latest && cleanField(latest, checkedAt);
-      if (clean && (result.measuredAt === null || clean.measuredAt > result.measuredAt)) result.measuredAt = clean.measuredAt;
+    // Usually the newest known field is valid, so stop after checking it instead
+    // of scanning the entire values table once for each of the nine fields.
+    // The outer lookup retains the original per-field ordering for equal stamps.
+    // Only numeric snapshots are projected; unrelated thread IDs stay private.
+    const latest = db.prepare(`SELECT ${projection} FROM thread_metric_values
+      WHERE field=(SELECT field FROM thread_metric_values
+        WHERE field IN (${FIELDS.map(() => '?').join(',')}) AND measured_at<=?
+        ORDER BY measured_at DESC LIMIT 1)
+      AND measured_at<=? ORDER BY measured_at DESC LIMIT 1`).get(...FIELDS, checkedAt, checkedAt);
+    const newest = latest && cleanField(latest, checkedAt);
+    if (newest) result.measuredAt = newest.measuredAt;
+    else if (latest) {
+      // A malformed newest value masks older values of that field. Preserve
+      // that behavior and inspect the remaining fields, at most nine reads total.
+      const nextField = db.prepare(`SELECT ${projection} FROM thread_metric_values WHERE field=? AND measured_at<=? ORDER BY measured_at DESC LIMIT 1`);
+      for (const field of FIELDS) {
+        if (field === latest.field) continue;
+        const row = nextField.get(field, checkedAt);
+        const clean = row && cleanField(row, checkedAt);
+        if (clean && (result.measuredAt === null || clean.measuredAt > result.measuredAt)) result.measuredAt = clean.measuredAt;
+      }
     }
     if (result.measuredAt !== null) result.sourceAge = checkedAt - result.measuredAt;
     if (!ids.length) return result;

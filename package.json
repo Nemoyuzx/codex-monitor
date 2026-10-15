@@ -15,7 +15,7 @@
     "check": "node scripts/check-syntax.mjs",
     "demo": "node scripts/demo.mjs"
   },
-  "files": ["bin/", "scripts/", "*.mjs", "README.md", "CONTRIBUTING.md", "LICENSE"],
+  "files": ["bin/", "scripts/", "locales/", "*.mjs", "README*.md", "CONTRIBUTING.md", "LICENSE"],
   "repository": { "type": "git", "url": "https://github.com/Nemoyuzx/codex-monitor.git" },
   "bugs": { "url": "https://github.com/Nemoyuzx/codex-monitor/issues" },
   "homepage": "https://github.com/Nemoyuzx/codex-monitor#readme",

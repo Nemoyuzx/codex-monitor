@@ -12,10 +12,11 @@
 //   CODEX_HOME=/path/.codex node codex-status.mjs -w
 
 import { discoverDatabase } from './database-discovery.mjs';
-import { execSync, execFileSync } from 'node:child_process';
+import { execSync, execFileSync, execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { fitRows, truncVis, padVis, renderResourcePanel } from './resource-panel.mjs';
 import { dashboardLayout, renderInformationSections, composeInformationPane } from './dashboard-layout.mjs';
 import { createHostSampler } from './host-metrics.mjs';
@@ -25,11 +26,20 @@ import { createNetworkProbeSampler } from './network-probes.mjs';
 import { createBackgroundProbes } from './background-probes.mjs';
 import { readPerformanceMetrics } from './performance-metrics.mjs';
 import { buildDashboardRegions, bytes as dashboardBytes } from './dashboard-model.mjs';
-import { parseOptions, VIEW_NAMES, reduceKey, createKeyDecoder } from './monitor-options.mjs';
+import { parseOptions, getViewNames, reduceKey, createKeyDecoder } from './monitor-options.mjs';
+import { createTranslator, getLocale, setLocale, resolveLocale, formatAgo } from './i18n.mjs';
+import { statusMessages } from './locales/status.mjs';
+
+const t = createTranslator(statusMessages);
+const execFileAsync = promisify(execFile);
 
 let options;
-try { options = parseOptions(process.argv.slice(2)); }
-catch (error) { console.error(error.message + '\n使用 --help 查看用法'); process.exit(1); }
+try { options = parseOptions(process.argv.slice(2)); setLocale(options.lang); }
+catch (error) {
+  let locale = error.locale || 'en';
+  if (!error.locale) { try { locale = resolveLocale(); } catch {} }
+  console.error(error.message + '\n' + t('usageHint', {}, locale)); process.exit(1);
+}
 const watch = options.watch;
 const interval = options.interval;
 let uiState = { view: options.view, paused: false, showHelp: false, leftOffset: 0, windowSeconds: options.windowSeconds };
@@ -93,10 +103,11 @@ const yellow = s => col('33', s);
 const cyan = s => col('36', s);
 const magenta = s => col('35', s);
 function hdr(s) { return bold(cyan(s)); }
-function paintVerdict(v) {
-  if (/崩溃|异常|挂起|失败/.test(v)) return bold(red(v));
-  if (/空转|等待|疑似|泄漏|暂无|数据不完整|不可用/.test(v)) return bold(yellow(v));
-  return bold(green(v));
+function paintVerdict(key) {
+  // Severity follows the semantic verdict, independent of its translated text.
+  const paint = ['verdictExited', 'verdictNetwork', 'verdictHung'].includes(key) ? red
+    : ['verdictIncomplete', 'verdictPolling'].includes(key) ? yellow : green;
+  return bold(paint(t(key)));
 }
 
 // ---- sqlite（只读打开） ----
@@ -146,14 +157,8 @@ function fmtTs(ms) {
   return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' +
          p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
 }
-function age(ms) {
-  const s = Math.round((NOW - ms) / 1000);
-  if (s < 0) return '刚刚';
-  if (s < 60) return s + ' 秒前';
-  if (s < 3600) return Math.floor(s / 60) + ' 分钟前';
-  if (s < 86400) return Math.floor(s / 3600) + ' 小时前';
-  return Math.floor(s / 86400) + ' 天前';
-}
+function age(ms) { return formatAgo(ms, NOW); }
+
 function clip(s, n) {
   n = n || 160;
   if (s == null) return '';
@@ -169,11 +174,9 @@ function fmtBytes(n) {
 }
 function human(n) {
   if (n == null || isNaN(n)) return '0';
-  if (n >= 1e12) return parseFloat((n / 1e12).toFixed(2)) + ' 万亿';
-  if (n >= 1e8) return parseFloat((n / 1e8).toFixed(1)) + ' 亿';
-  if (n >= 1e4) return parseFloat((n / 1e4).toFixed(1)) + ' 万';
-  return String(n);
+  return new Intl.NumberFormat(getLocale(), { notation: 'compact', maximumFractionDigits: 2 }).format(n);
 }
+
 function msgText(o) {
   if (!o) return '';
   if (typeof o.text === 'string' && o.text) return o.text;
@@ -188,9 +191,9 @@ function msgText(o) {
   if (typeof o.content === 'string') return o.content;
   return '';
 }
-function label(t, n) {
+function label(thread, n) {
   n = n || 40;
-  return t.agent_nickname || t.name || clip(t.title, n) || clip(t.id, 8) || '(未命名)';
+  return thread.agent_nickname || thread.name || clip(thread.title, n) || clip(thread.id, 8) || t('unnamed');
 }
 function describe(type, json) {
   let o = null;
@@ -202,17 +205,17 @@ function describe(type, json) {
   if (type === 'fileChange') {
     const arr = Array.isArray(o.changes) ? o.changes : [];
     const c = (arr[0] && arr[0].path) || o.path || '';
-    return '改文件: ' + clip(c, 90);
+    return t('eventFileChange', { path: clip(c, 90) });
   }
   if (type === 'mcpToolCall') return (o.server || '') + '.' + (o.tool || '') + '  (' + (o.status || '') + ')';
-  if (type === 'webSearch') return '搜索: ' + clip(o.query || (o.arguments && o.arguments.query) || '', 90);
-  if (type === 'subAgentActivity') return '子代理活动: ' + (o.kind || o.activityType || o.status || '');
-  if (type === 'collabAgentToolCall') return 'collab 调用: ' + clip(o.toolName || o.name || o.tool || '', 60);
-  if (type === 'dynamicToolCall') return 'dynamic 调用: ' + clip(o.name || o.tool || '', 60);
-  if (type === 'plan') return '计划: ' + clip(o.title || o.name || '', 60);
-  if (type === 'contextCompaction') return '上下文压缩';
-  if (type === 'imageView') return '查看图片';
-  if (type === 'imageGeneration') return '生成图片';
+  if (type === 'webSearch') return t('eventSearch', { query: clip(o.query || (o.arguments && o.arguments.query) || '', 90) });
+  if (type === 'subAgentActivity') return t('eventSubagent', { activity: o.kind || o.activityType || o.status || '' });
+  if (type === 'collabAgentToolCall') return t('eventCollab', { tool: clip(o.toolName || o.name || o.tool || '', 60) });
+  if (type === 'dynamicToolCall') return t('eventDynamic', { tool: clip(o.name || o.tool || '', 60) });
+  if (type === 'plan') return t('eventPlan', { title: clip(o.title || o.name || '', 60) });
+  if (type === 'contextCompaction') return t('eventCompaction');
+  if (type === 'imageView') return t('eventImageView');
+  if (type === 'imageGeneration') return t('eventImageGeneration');
   return type;
 }
 function sh(cmd) {
@@ -246,8 +249,11 @@ function sysStatic() {
   return SYSINFO;
 }
 function loadAvg() {
-  const m = sh('sysctl -n vm.loadavg').match(/[\d.]+/g);
-  return m && m.length >= 3 ? m.slice(0, 3).map(Number) : [null, null, null];
+  try {
+    const values = os.loadavg();
+    if (values.length >= 3 && values.slice(0, 3).every(Number.isFinite)) return values.slice(0, 3);
+  } catch {}
+  return [null, null, null];
 }
 const fmtLoad = (value, digits = 1) => Number.isFinite(value) ? value.toFixed(digits) : '—';
 const fmtSampleRate = value => Number.isFinite(value) && value >= 0 ? fmtRate(value) : '—';
@@ -284,10 +290,13 @@ function toBytes(v, u) {
   return Number(v) * (mult[(u || '').toUpperCase()] || 1);
 }
 let topCache = null, topCacheAt = 0, topPrev = null;
-function topSample() {
+async function topSample() {
   const now = Date.now();
   if (topCache && (now - topCacheAt) < 2500) return topCache;
-  const s = sh('top -l 1 -n 0');
+  let s = '';
+  try {
+    ({ stdout: s } = await execFileAsync('top', ['-l', '1', '-n', '0'], { encoding: 'utf8', timeout: 3500, maxBuffer: 16 * 1024 * 1024 }));
+  } catch {}
   const o = { at: now };
   let m;
   if ((m = s.match(/Processes:\s*(\d+)\s*total,\s*(\d+)\s*running,\s*(?:(\d+)\s*stuck,\s*)?(\d+)\s*sleeping,\s*(\d+)\s*threads/))) {
@@ -322,12 +331,17 @@ function topSample() {
   topCache = o; topCacheAt = now;
   return o;
 }
+function powerState(value) {
+  const states = { charged: 'powerCharged', charging: 'powerCharging', discharging: 'powerDischarging', 'finishing charge': 'powerFinishing', 'ac attached': 'powerAc' };
+  const state = String(value || '').toLowerCase();
+  return Object.hasOwn(states, state) ? t(states[state]) : value;
+}
 function fmtUptime(sec) {
   if (!sec || sec < 0) return '?';
   const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
-  if (d > 0) return d + '天' + h + '时';
-  if (h > 0) return h + '时' + m + '分';
-  return m + '分';
+  if (d > 0) return t('uptimeDays', { days: d, hours: h });
+  if (h > 0) return t('uptimeHours', { hours: h, minutes: m });
+  return t('uptimeMinutes', { minutes: m });
 }
 // ---- 终端宽度 / 两栏布局 ----
 function composeColumns(left, right, cols) {
@@ -399,19 +413,20 @@ async function runOnce() {
   const lines = [];
 
   // 头部
-  lines.push(bold('Codex 本地状态') + '  ' + cyan(fmtTs(NOW)));
-  lines.push(dim('数据源  ' + CODEX_HOME));
+  lines.push(bold(t('title')) + '  ' + cyan(fmtTs(NOW)));
+  lines.push(dim(t('dataSource', { path: CODEX_HOME })));
   const model = cfgVal('model') || '?';
   const sandbox = cfgVal('sandbox_mode') || '?';
   const reas = cfgVal('model_reasoning_effort') || '?';
   const mcpN = mcpServerCount();
   let cliVer = '';
   if (ST) { const r = one(ST.db, "SELECT cli_version FROM threads WHERE cli_version<>'' ORDER BY updated_at_ms DESC LIMIT 1"); cliVer = r?.cli_version || ''; }
-  lines.push(dim('环境    ') + '模型 ' + cyan(model) + ' · 沙箱 ' + yellow(sandbox) + ' · 推理 ' + (reas || '?') + ' · MCP ' + mcpN + (cliVer ? ' · CLI ' + cliVer : ''));
+  lines.push(t('environment', { label: dim(t('environmentLabel')), model: cyan(model), sandbox: yellow(sandbox), reasoning: reas || '?', mcp: mcpN, cli: cliVer ? ' · CLI ' + cliVer : '' }));
   lines.push(dim('\u2500'.repeat(twoCol ? leftW : 78)));
 
   const sampleStarted = Date.now();
   const forceThisSample = forceNetworkRefresh;
+  const topPromise = topSample();
   const legacyProbeTask = legacyProbeController.refresh(null, { force: forceThisSample });
   const host = hostSampler.sample();
   const networkDetailsPromise = networkDetailsSampler.sample({ interfaceName: host.network.interfaceName, force: forceNetworkRefresh });
@@ -467,7 +482,7 @@ async function runOnce() {
   }
   const swap = parseSwap();
   const swapBytes = swap.used;
-  const tm = topSample();
+  const tm = await topPromise;
   const batt = host.power;
   const memPct = Number.isFinite(tm.memUsed) && sys.mem > 0 ? tm.memUsed / sys.mem * 100 : null;
   const toolRate = Number.isFinite(activity.tools.completed10m) ? activity.tools.completed10m / 600 : null;
@@ -479,24 +494,24 @@ async function runOnce() {
   const memCol = memPct == null ? dim : memPct < 80 ? green : (memPct < 95 ? yellow : red);
   const tp = procs.slice(0, 3);
   lines.push('');
-  lines.push(magenta(bold('主机状态')) + '  ' + dim((sys.brand || '?') + ' · ' + (sys.ncpu || '?') + ' 核 · ' + fmtBytes(sys.mem) + ' · up ' + fmtUptime(Math.floor(NOW / 1000) - sys.bootSec)));
-  lines.push('  负载  ' + loadCol(bold('1m ' + fmtLoad(load[0]))) + dim(' · 5m ' + fmtLoad(load[1]) + ' · 15m ' + fmtLoad(load[2])) + '（' + (sys.ncpu || '?') + ' 核）');
-  if (Number.isFinite(memPct)) lines.push('  内存  ' + memCol(bold(memPct.toFixed(1)) + '%') + dim('（物理已用 ' + fmtBytes(tm.memUsed) + ' / ' + fmtBytes(sys.mem) + '）'));
-  lines.push('  CPU   全机 ' + (Number.isFinite(host.cpu.usagePercent) ? bold(host.cpu.usagePercent.toFixed(1) + '%') : '—') + ' · Codex ' + (Number.isFinite(codexCpu) ? codexCpu.toFixed(1) + '%（多核）' : '—') + ' · RSS ' + dashboardBytes(host.processes.rssBytes));
-  lines.push('  网络  ' + (netRate >= 0 ? cyan(fmtBytes(Math.round(netRate * 1024)) + '/s') : dim('—')));
-  if (tp.length) lines.push('  占用  ' + tp.map(p => (p.cpu > 50 ? red : cyan)(clip(p.name, 18) + ' ' + p.cpu.toFixed(0) + '%')).join(' · '));
+  lines.push(magenta(bold(t('hostTitle'))) + '  ' + dim(t('hostSummary', { brand: sys.brand || '?', cores: sys.ncpu || '?', memory: fmtBytes(sys.mem), uptime: fmtUptime(Math.floor(NOW / 1000) - sys.bootSec) })));
+  lines.push(t('hostLoad', { current: loadCol(bold('1m ' + fmtLoad(load[0]))), averages: dim(' · 5m ' + fmtLoad(load[1]) + ' · 15m ' + fmtLoad(load[2])), cores: sys.ncpu || '?' }));
+  if (Number.isFinite(memPct)) lines.push(t('hostMemory', { percent: memCol(bold(memPct.toFixed(1)) + '%'), detail: dim(t('physicalUsed', { used: fmtBytes(tm.memUsed), total: fmtBytes(sys.mem) })) }));
+  lines.push(t('hostCpu', { cpu: Number.isFinite(host.cpu.usagePercent) ? bold(host.cpu.usagePercent.toFixed(1) + '%') : '—', codex: Number.isFinite(codexCpu) ? t('multiCorePercent', { percent: codexCpu.toFixed(1) }) : '—', rss: dashboardBytes(host.processes.rssBytes) }));
+  lines.push(t('hostNetwork', { rate: netRate >= 0 ? cyan(fmtBytes(Math.round(netRate * 1024)) + '/s') : dim('—') }));
+  if (tp.length) lines.push(t('hostTopCpu', { processes: tp.map(p => (p.cpu > 50 ? red : cyan)(clip(p.name, 18) + ' ' + p.cpu.toFixed(0) + '%')).join(' · ') }));
   lines.push('');
-  lines.push(yellow(bold('活动监视器')) + dim('  top -l 1'));
-  if (tm.cpuUser != null) lines.push('  CPU    user ' + bold(tm.cpuUser.toFixed(1)) + '% · sys ' + bold(tm.cpuSys.toFixed(1)) + '% · idle ' + tm.cpuIdle.toFixed(1) + '%');
-  if (tm.procTotal != null) lines.push('  进程   ' + bold(String(tm.procTotal)) + '（运行 ' + tm.procRunning + ' · 睡眠 ' + tm.procSleeping + '）· 线程 ' + bold(String(tm.threads)));
-  if (tm.memUsed != null) lines.push('  内存   已用 ' + bold(fmtBytes(tm.memUsed)) + '（wired ' + fmtBytes(tm.memWired) + ' · 压缩 ' + fmtBytes(tm.memComp) + '）· 空闲 ' + fmtBytes(tm.memUnused));
-  lines.push('  VM     App ' + fmtBytes(anonBytes) + ' · 缓存 ' + fmtBytes(cachedBytes) + ' · swap ' + (swap.used == null ? '—' : swap.used > 0 ? yellow(fmtBytes(swap.used)) : '0') + '/' + fmtBytes(swap.total));
-  if (tm.swapins != null) lines.push('  换页   in ' + human(tm.swapins) + ' · out ' + human(tm.swapouts) + '（累计）· ' + fmtSampleRate(pageinRate) + '/s · ' + fmtSampleRate(pageoutRate) + '/s');
-  if (tm.netByteIn != null) lines.push('  网络   累计 ↓' + fmtBytes(tm.netByteIn) + ' ' + human(tm.netPktIn) + 'pkt ↑' + fmtBytes(tm.netByteOut) + ' ' + human(tm.netPktOut) + 'pkt');
-  if (tm.netPktInRate != null) lines.push('  网速   ↓' + (netInRate >= 0 ? bold(fmtBytes(Math.round(netInRate)) + '/s') : '—') + ' ' + fmtRate(tm.netPktInRate) + 'pkt ↑' + (netOutRate >= 0 ? bold(fmtBytes(Math.round(netOutRate)) + '/s') : '—') + ' ' + fmtRate(tm.netPktOutRate) + 'pkt');
-  if (tm.diskByteRead != null) lines.push('  磁盘   累计 读 ' + fmtBytes(tm.diskByteRead) + ' ' + human(tm.diskOpRead) + 'op · 写 ' + fmtBytes(tm.diskByteWrite) + ' ' + human(tm.diskOpWrite) + 'op');
-  lines.push('  盘速   读 ' + bold(dashboardBytes(dio.rRate) + '/s') + ' ' + fmtSampleRate(dio.rOpRate) + 'op · 写 ' + bold(dashboardBytes(dio.wRate) + '/s') + ' ' + fmtSampleRate(dio.wOpRate) + 'op');
-  if (batt) lines.push('  电池   ' + bold(String(batt.pct)) + '% · ' + batt.state);
+  lines.push(yellow(bold(t('activityMonitor'))) + dim('  top -l 1'));
+  if (tm.cpuUser != null) lines.push(t('cpuBreakdown', { user: bold(tm.cpuUser.toFixed(1)), system: bold(tm.cpuSys.toFixed(1)), idle: tm.cpuIdle.toFixed(1) }));
+  if (tm.procTotal != null) lines.push(t('processSummary', { total: bold(String(tm.procTotal)), running: tm.procRunning, sleeping: tm.procSleeping, threads: bold(String(tm.threads)) }));
+  if (tm.memUsed != null) lines.push(t('memorySummary', { used: bold(fmtBytes(tm.memUsed)), wired: fmtBytes(tm.memWired), compressed: fmtBytes(tm.memComp), free: fmtBytes(tm.memUnused) }));
+  lines.push(t('vmSummary', { app: fmtBytes(anonBytes), cache: fmtBytes(cachedBytes), swap: swap.used == null ? '—' : swap.used > 0 ? yellow(fmtBytes(swap.used)) : '0', total: fmtBytes(swap.total) }));
+  if (tm.swapins != null) lines.push(t('swapSummary', { input: human(tm.swapins), output: human(tm.swapouts), inRate: fmtSampleRate(pageinRate), outRate: fmtSampleRate(pageoutRate) }));
+  if (tm.netByteIn != null) lines.push(t('networkTotals', { input: fmtBytes(tm.netByteIn), inPackets: human(tm.netPktIn), output: fmtBytes(tm.netByteOut), outPackets: human(tm.netPktOut) }));
+  if (tm.netPktInRate != null) lines.push(t('networkRates', { input: netInRate >= 0 ? bold(fmtBytes(Math.round(netInRate)) + '/s') : '—', inPackets: fmtRate(tm.netPktInRate), output: netOutRate >= 0 ? bold(fmtBytes(Math.round(netOutRate)) + '/s') : '—', outPackets: fmtRate(tm.netPktOutRate) }));
+  if (tm.diskByteRead != null) lines.push(t('diskTotals', { read: fmtBytes(tm.diskByteRead), reads: human(tm.diskOpRead), write: fmtBytes(tm.diskByteWrite), writes: human(tm.diskOpWrite) }));
+  lines.push(t('diskRates', { read: bold(dashboardBytes(dio.rRate) + '/s'), reads: fmtSampleRate(dio.rOpRate), write: bold(dashboardBytes(dio.wRate) + '/s'), writes: fmtSampleRate(dio.wOpRate) }));
+  if (batt) lines.push(t('battery', { percent: bold(String(batt.pct)), state: powerState(batt.state) }));
 
   // [1] 最近可见事件
   let merged = [];
@@ -512,25 +527,25 @@ async function runOnce() {
   }
   const newestVisible = merged[0] || null;
   lines.push('');
-  lines.push(hdr('[1] 最近一次可见事件'));
+  lines.push(hdr(t('eventsTitle')));
   if (newestVisible) {
-    lines.push('    类型   : ' + bold(newestVisible.item_type) + (newestVisible.nick ? ' · 来自「' + cyan(newestVisible.nick) + '」' : ''));
-    lines.push('    内容   : ' + (describe(newestVisible.item_type, newestVisible.item_json) || '(空)'));
-    lines.push('    时间   : ' + cyan(fmtTs(newestVisible.created_at_ms)));
-    lines.push('    距现在 : ' + bold(age(newestVisible.created_at_ms)));
+    lines.push(t('eventType', { type: bold(newestVisible.item_type), source: newestVisible.nick ? t('eventSource', { name: cyan(newestVisible.nick) }) : '' }));
+    lines.push(t('eventContent', { text: describe(newestVisible.item_type, newestVisible.item_json) || t('empty') }));
+    lines.push(t('eventTime', { time: cyan(fmtTs(newestVisible.created_at_ms)) }));
+    lines.push(t('eventAge', { age: bold(age(newestVisible.created_at_ms)) }));
   } else {
-    lines.push('    （未发现可见事件）');
+    lines.push(t('noVisibleEvents'));
   }
   const lastAgent = merged.find(r => r.item_type === 'agentMessage');
   const lastUser = merged.find(r => r.item_type === 'userMessage');
   if (lastAgent || lastUser) {
     lines.push('    ----');
-    if (lastAgent) lines.push('    最近一条智能体消息 : ' + bold(age(lastAgent.created_at_ms)) + ' · ' + clip(describe('agentMessage', lastAgent.item_json), 90));
-    if (lastUser) lines.push('    最近一条用户消息   : ' + bold(age(lastUser.created_at_ms)) + ' · ' + clip(describe('userMessage', lastUser.item_json), 90));
+    if (lastAgent) lines.push(t('lastAgent', { age: bold(age(lastAgent.created_at_ms)), text: clip(describe('agentMessage', lastAgent.item_json), 90) }));
+    if (lastUser) lines.push(t('lastUser', { age: bold(age(lastUser.created_at_ms)), text: clip(describe('userMessage', lastUser.item_json), 90) }));
   }
   const recent = merged.slice(0, 6);
   if (recent.length) {
-    lines.push('    最近可见事件（倒序）:');
+    lines.push(t('recentEvents'));
     for (const r of recent) lines.push('      - ' + dim(age(r.created_at_ms)) + '  ' + cyan(r.item_type) + '  ' + describe(r.item_type, r.item_json).slice(0, 84));
   }
 
@@ -544,21 +559,21 @@ async function runOnce() {
   const toolLowerBound = !activity.coverage.pendingComplete;
   const hungTools = unfinishedRecent.filter(u => u.created_at_ms < NOW - 300000);
   lines.push('');
-  lines.push(hdr('[2] 有没有工具调用没看到完成输出'));
-  if (!activity.availability.history || activity.tools.pending == null) lines.push(yellow('    工具数据不可用'));
+  lines.push(hdr(t('toolsTitle')));
+  if (!activity.availability.history || activity.tools.pending == null) lines.push(yellow(t('toolsUnavailable')));
   else if (hungTools.length) {
-    lines.push('    ' + red('疑似挂起 ' + hungTools.length + ' 个') + '（已观测到启动 >5 分钟的未完成项）:');
+    lines.push('    ' + red(t('hungTools', { count: hungTools.length })) + t('hungToolsDetail'));
     for (const u of hungTools.slice(0, 10)) lines.push('      - ' + u.nick + ' : ' + u.item_type + ' · ' + age(u.started_at_ms || u.created_at_ms));
   } else if (unfinishedRecent.length) {
-    lines.push('    ' + yellow('有 ' + unfinishedRecent.length + ' 个工具调用刚启动、尚未完成') + '（可能正在执行）:');
+    lines.push('    ' + yellow(t('pendingTools', { count: unfinishedRecent.length })) + t('pendingToolsDetail'));
     for (const u of unfinishedRecent.slice(0, 10)) lines.push('      - ' + u.nick + ' : ' + u.item_type + ' · ' + age(u.started_at_ms || u.created_at_ms));
   } else {
-    lines.push('    ' + green('未发现') + ' —— 当前工具采样未发现近期未完成项。' + (toolLowerBound ? '（有界扫描，未证明全量完整）' : ''));
+    lines.push('    ' + green(t('notFound')) + t('noPendingTools') + (toolLowerBound ? t('boundedScan') : ''));
   }
-  if (unfinishedStale > 0) lines.push(dim('    （另有 ' + unfinishedStale + ' 个更早的历史未完成项，多为被中断的旧会话遗留，可忽略。）'));
+  if (unfinishedStale > 0) lines.push(dim(t('staleTools', { count: unfinishedStale })));
   const recentRunning = runningTurns.filter(t => !t.stale);
   const staleRunning = activity.turns.staleRunning || 0;
-  lines.push('    处于 inProgress 的 turn：共 ' + bold(String(activity.turns.totalRunning ?? '—')) + ' 个，最近 1 小时内 ' + bold(String(activity.turns.recentRunning ?? '—')) + ' 个。');
+  lines.push(t('runningTurns', { total: bold(String(activity.turns.totalRunning ?? '—')), recent: bold(String(activity.turns.recentRunning ?? '—')) }));
   const nickById = {};
   if (ST && recentRunning.length) {
     const ids = [...new Set(recentRunning.map(t => t.thread_id))];
@@ -567,8 +582,8 @@ async function runOnce() {
       nickById[id] = r ? label(r, 24) : clip(id, 8);
     }
   }
-  for (const t of recentRunning.slice(0, 8)) lines.push('      - 「' + (nickById[t.thread_id] || '?') + '」开始于 ' + age(t.started_at * 1000));
-  if (staleRunning) lines.push(dim('    备注：另有 ' + staleRunning + ' 个 inProgress turn 是 1 小时前遗留的（多为历史未收尾会话，可忽略）。'));
+  for (const turn of recentRunning.slice(0, 8)) lines.push(t('turnStarted', { name: nickById[turn.thread_id] || '?', age: age(turn.started_at * 1000) }));
+  if (staleRunning) lines.push(dim(t('staleTurns', { count: staleRunning })));
 
   // 空转检测
   let sleepLoopCount = 0;
@@ -591,11 +606,11 @@ async function runOnce() {
   const goalsCount = activity.goals.active;
 
   lines.push('');
-  lines.push(hdr('[3] 进程 · MCP · 队列 · 目标'));
-  lines.push('    进程      : ' + (host.processes.available ? 'app-server ×' + bold(String(appServerProc)) + (appServerProc > 0 ? green(' ✓') : red(' ✗')) + ' · exec-server ×' + execServerProc + ' · code-mode-host ×' + codeModeHostProc : dim('数据不可用')));
-  lines.push('    可辨 MCP   : ' + bold(mcpTotal == null ? '—' : String(mcpTotal)) + (mcpDetail.length ? '（' + mcpDetail.slice(0, 3).map(d => d.name + ' ×' + d.n).join('、') + '）' : '') + dim(' · 配置 ' + mcpN + ' 个，未识别子进程不计入'));
-  lines.push('    云端队列  : queued_items ' + (queuedItems == null ? dim('—') : queuedItems > 0 ? yellow(String(queuedItems)) : green('0（无积压）')) + ' · revisions ' + (queuedRevs ?? '—'));
-  lines.push('    进行中目标 : ' + bold(goalsCount == null ? '—' : String(goalsCount)) + ' 个 · 全部 ' + (activity.goals.total ?? '—'));
+  lines.push(hdr(t('processesTitle')));
+  lines.push(t('processes', { processes: host.processes.available ? 'app-server ×' + bold(String(appServerProc)) + (appServerProc > 0 ? green(' ✓') : red(' ✗')) + ' · exec-server ×' + execServerProc + ' · code-mode-host ×' + codeModeHostProc : dim(t('unavailable')) }));
+  lines.push(t('mcpProcesses', { count: bold(mcpTotal == null ? '—' : String(mcpTotal)), detail: mcpDetail.length ? ' (' + mcpDetail.slice(0, 3).map(d => d.name + ' ×' + d.n).join(', ') + ')' : '', config: dim(t('mcpConfigured', { count: mcpN })) }));
+  lines.push(t('cloudQueue', { count: queuedItems == null ? dim('—') : queuedItems > 0 ? yellow(String(queuedItems)) : green(t('zeroQueue')), revisions: queuedRevs ?? '—' }));
+  lines.push(t('activeGoals', { active: bold(goalsCount == null ? '—' : String(goalsCount)), total: activity.goals.total ?? '—' }));
 
   // [4] 网络探针
   let ipcSocket = false;
@@ -608,15 +623,15 @@ async function runOnce() {
   const legacyProbeState = legacyProbeController.getState();
   const netOk = probeRes.length === 4 && probeRes.every(x => x.status != null);
   lines.push('');
-  lines.push(hdr('[4] 网络探针'));
-  lines.push('    本地 IPC  : ' + (ipcSocket ? green('ipc.sock 存在（OK）') : red('未发现 ipc.sock')) + ' · 网络服务 ' + (netServiceProc > 0 ? green('运行中') : red('未发现')));
-  if (options.noProbes) lines.push(dim('    外部探针已关闭（--no-probes）'));
-  else if (legacyProbeState.sampling && !probeRes.length) lines.push(dim('    默认请求 HTTP 探针正在后台检测…'));
+  lines.push(hdr(t('networkTitle')));
+  lines.push(t('localIpc', { socket: ipcSocket ? green(t('ipcPresent')) : red(t('ipcMissing')), service: netServiceProc > 0 ? green(t('running')) : red(t('notFound')) }));
+  if (options.noProbes) lines.push(dim(t('probesDisabled')));
+  else if (legacyProbeState.sampling && !probeRes.length) lines.push(dim(t('probesSampling')));
   for (const result of probeRes) {
     const paint = !result.status ? red : result.status >= 400 ? yellow : green;
     lines.push('    ' + result.label.padEnd(18) + ': ' + paint(result.status ? 'HTTP ' + result.status : result.error) + ' · ' + result.latencyMs + 'ms');
   }
-  if (probeRes.some(result => result.status >= 400)) lines.push(dim('    HTTP 响应表明链路可达；拒绝响应不代表登录或服务可用。'));
+  if (probeRes.some(result => result.status >= 400)) lines.push(dim(t('httpReachabilityNote')));
 
   // [5] 存储 · 日志 · 用量
   const inv = dbInventory();
@@ -647,58 +662,58 @@ async function runOnce() {
     dfCap = p[4] || '';
   }
   lines.push('');
-  lines.push(hdr('[5] 存储 · 日志 · 用量'));
-  lines.push('    累计 token : ' + bold(tokenSum == null ? '—' : human(tokenSum)) + (topModel ? '（未归档累计；近期模型 ' + cyan(topModel) + '）' : ''));
-  lines.push('    本次增量   : ' + bold(activity.tokens.monitorDelta == null ? '—' : human(activity.tokens.monitorDelta)) + ' token（累计计数变化）');
+  lines.push(hdr(t('storageTitle')));
+  lines.push(t('tokenTotal', { count: bold(tokenSum == null ? '—' : human(tokenSum)), model: topModel ? t('tokenModel', { model: cyan(topModel) }) : '' }));
+  lines.push(t('tokenDelta', { count: bold(activity.tokens.monitorDelta == null ? '—' : human(activity.tokens.monitorDelta)) }));
   const measuredSpeed = activity.sessions.rows.map(task => performanceCache.byThread[task.id]?.fields.tokensPerSecond).find(Boolean);
-  lines.push('    原生速度   : ' + (measuredSpeed ? '缓存 ≈' + measuredSpeed.value.toFixed(1) + ' tok/s · ' + age(measuredSpeed.measuredAt) : '—（尚无匹配的完整观测）'));
+  lines.push(t('nativeSpeed', { speed: measuredSpeed ? t('cachedSpeed', { speed: measuredSpeed.value.toFixed(1), age: age(measuredSpeed.measuredAt) }) : t('noSpeed') }));
   {
     const win = Number(cfgVal('model_context_window')) || 0;
     const auto = Number(cfgVal('model_auto_compact_token_limit')) || 0;
     const comps = merged.filter(r => r.item_type === 'contextCompaction').length;
-    lines.push('    上下文     : 窗口 ' + (win ? human(win) : '?') + (auto ? ' · 压缩阈值 ' + human(auto) : '') + (comps > 0 ? ' · 近期压缩 ' + comps + ' 次' : ' · 近期无压缩'));
+    lines.push(t('contextWindow', { window: win ? human(win) : '?', threshold: auto ? t('compactionThreshold', { count: human(auto) }) : '', recent: comps > 0 ? t('recentCompactions', { count: comps }) : t('noRecentCompactions') }));
   }
-  lines.push('    缺页率   : ' + bold(fmtSampleRate(faultRate)) + '/s · 换页 ' + fmtSampleRate(pageinRate) + ' in / ' + fmtSampleRate(pageoutRate) + ' out');
-  lines.push('    压缩内存 : ' + fmtBytes(compPages * pageSize) + '（原始 ' + fmtBytes(compStored * pageSize) + '）· swap ' + (swapBytes == null ? '—' : swapBytes > 0 ? yellow(fmtBytes(swapBytes)) : '0'));
-  if (codexDirSize() > 0) lines.push('    数据目录   : ' + bold(fmtBytes(codexDirSize())) + ' · DB 文件 ' + fmtBytes(dbTotal));
-  else lines.push('    DB 文件    : ' + fmtBytes(dbTotal));
-  if (topDb) lines.push('    最大 DB    : ' + topDb.f + ' ' + bold(fmtBytes(topDb.s)));
-  if (topWal && topWal.s > 50 * 1024 * 1024) lines.push('    WAL 积压   : ' + yellow(topWal.f + ' ' + fmtBytes(topWal.s)) + '（偏大，可能未 checkpoint）');
-  else if (topWal) lines.push('    最大 WAL   : ' + topWal.f + ' ' + fmtBytes(topWal.s));
-  if (dfAvail) lines.push('    磁盘       : 可用 ' + green(dfAvail) + '（' + dfCap + ' 已用）');
-  lines.push('    日志心跳   : ' + (lastLogSec != null ? cyan(age(lastLogSec * 1000)) : '无') + '；近 10 分钟 ERROR=' + (errRecent == null ? '—' : errRecent > 0 ? red(String(errRecent)) : '0') + ' WARN=' + (warnRecent == null ? '—' : warnRecent > 0 ? yellow(String(warnRecent)) : '0') + ' INFO=' + (activity.availability.logs ? lvls.INFO || 0 : '—') + ' DEBUG=' + (activity.availability.logs ? lvls.DEBUG || 0 : '—') + ' TRACE=' + (activity.availability.logs ? lvls.TRACE || 0 : '—'));
+  lines.push(t('pageFaults', { faults: bold(fmtSampleRate(faultRate)), input: fmtSampleRate(pageinRate), output: fmtSampleRate(pageoutRate) }));
+  lines.push(t('compressedMemory', { compressed: fmtBytes(compPages * pageSize), original: fmtBytes(compStored * pageSize), swap: swapBytes == null ? '—' : swapBytes > 0 ? yellow(fmtBytes(swapBytes)) : '0' }));
+  if (codexDirSize() > 0) lines.push(t('dataDirectory', { size: bold(fmtBytes(codexDirSize())), db: fmtBytes(dbTotal) }));
+  else lines.push(t('dbFiles', { size: fmtBytes(dbTotal) }));
+  if (topDb) lines.push(t('largestDb', { file: topDb.f, size: bold(fmtBytes(topDb.s)) }));
+  if (topWal && topWal.s > 50 * 1024 * 1024) lines.push(t('walBacklog', { file: yellow(topWal.f + ' ' + fmtBytes(topWal.s)) }));
+  else if (topWal) lines.push(t('largestWal', { file: topWal.f, size: fmtBytes(topWal.s) }));
+  if (dfAvail) lines.push(t('diskFree', { free: green(dfAvail), percent: dfCap }));
+  lines.push(t('logHeartbeat', { age: lastLogSec != null ? cyan(age(lastLogSec * 1000)) : t('none'), errors: errRecent == null ? '—' : errRecent > 0 ? red(String(errRecent)) : '0', warnings: warnRecent == null ? '—' : warnRecent > 0 ? yellow(String(warnRecent)) : '0', info: activity.availability.logs ? lvls.INFO || 0 : '—', debug: activity.availability.logs ? lvls.DEBUG || 0 : '—', trace: activity.availability.logs ? lvls.TRACE || 0 : '—' }));
   if (errSummary.length) {
-    for (const e of errSummary.slice(0, 3)) lines.push('    最近 ERROR : ' + red(clip(String(e.target), 28) + ' ×' + e.c) + ' — ' + errMsg(e.msg));
+    for (const e of errSummary.slice(0, 3)) lines.push(t('recentError', { target: red(clip(String(e.target), 28) + ' ×' + e.c), error: errMsg(e.msg) }));
   }
 
   // [6] 保守判断
   let verdict;
   const facts = [];
-  if (!host.processes.available) facts.push(dim('进程数据不可用')); else if (appServerProc > 0) facts.push(green('应用进程存活')); else facts.push(red('未发现 app-server'));
-  facts.push(dim('可辨 MCP ' + (mcpTotal ?? '—') + ' 个'));
-  if (queuedItems == null) facts.push(dim('队列未知')); else if (queuedItems > 0) facts.push(yellow('云端队列积压 ' + queuedItems)); else facts.push(green('队列无积压'));
-  if (netOk) facts.push(green('HTTP 链路可达')); else if (probeRes.length) facts.push(red('网络探测失败')); else if (options.noProbes) facts.push(dim('HTTP 探针关闭'));
-  if (errRecent == null) facts.push(dim('日志告警未知')); else if (errRecent > 0) facts.push(yellow('ERROR=' + errRecent)); else facts.push(green('近 10 分钟无 ERROR'));
+  if (!host.processes.available) facts.push(dim(t('processUnavailable'))); else if (appServerProc > 0) facts.push(green(t('appAlive'))); else facts.push(red(t('appServerMissing')));
+  facts.push(dim(t('identifiableMcp', { count: mcpTotal ?? '—' })));
+  if (queuedItems == null) facts.push(dim(t('queueUnknown'))); else if (queuedItems > 0) facts.push(yellow(t('queueBacklog', { count: queuedItems }))); else facts.push(green(t('queueEmpty')));
+  if (netOk) facts.push(green(t('httpReachable'))); else if (probeRes.length) facts.push(red(t('networkFailed'))); else if (options.noProbes) facts.push(dim(t('httpDisabled')));
+  if (errRecent == null) facts.push(dim(t('alertsUnknown'))); else if (errRecent > 0) facts.push(yellow('ERROR=' + errRecent)); else facts.push(green(t('noRecentErrors')));
 
-  if (!host.processes.available || !activity.availability.history || !activity.availability.state || !Number.isFinite(activity.turns.recentRunning)) verdict = '数据不完整，当前无法判断任务状态';
-  else if (appServerProc === 0) verdict = '应用可能已退出/崩溃，需人工介入';
-  else if (!netOk && probeRes.length) verdict = '应用存活，但网络异常，可能影响与 OpenAI 的通信';
-  else if (hungTools.length > 0) verdict = '有工具调用疑似挂起（超过 5 分钟没有完成输出），需关注';
-  else if (activity.turns.recentRunning > 0 && sleepLoopCount >= 3) verdict = '运行中，但最新线程疑似空转轮询（连续 sleep + 空推理），在等外部结果，暂无新产出';
-  else if (activity.turns.recentRunning > 0) verdict = '工作中（有近期进行中任务；工具状态以已观测范围为准）';
-  else verdict = '当前未发现近期进行中任务（历史遗留项单独列出）';
+  if (!host.processes.available || !activity.availability.history || !activity.availability.state || !Number.isFinite(activity.turns.recentRunning)) verdict = 'verdictIncomplete';
+  else if (appServerProc === 0) verdict = 'verdictExited';
+  else if (!netOk && probeRes.length) verdict = 'verdictNetwork';
+  else if (hungTools.length > 0) verdict = 'verdictHung';
+  else if (activity.turns.recentRunning > 0 && sleepLoopCount >= 3) verdict = 'verdictPolling';
+  else if (activity.turns.recentRunning > 0) verdict = 'verdictWorking';
+  else verdict = 'verdictIdle';
 
   lines.push('');
-  lines.push(hdr('[6] 当前状态的保守判断'));
+  lines.push(hdr(t('verdictTitle')));
   lines.push('    ' + paintVerdict(verdict));
-  lines.push(dim('    依据 : ' + facts.join('；')));
-  if (sleepLoopCount >= 3) lines.push(yellow('    （检测到最新线程末尾连续 ' + sleepLoopCount + ' 个 sleep 事件，据此判为空转。）'));
+  lines.push(dim(t('verdictFacts', { facts: facts.join('; ') })));
+  if (sleepLoopCount >= 3) lines.push(yellow(t('sleepLoop', { count: sleepLoopCount })));
   if (errRecent > 0 && errSummary.length) {
-    lines.push(dim('    备注 : 近 10 分钟的 ERROR 主要来自「' + clip(String(errSummary[0].target), 28) + '」(' + errMsg(errSummary[0].msg) + ')。'));
+    lines.push(dim(t('errorNote', { target: clip(String(errSummary[0].target), 28), error: errMsg(errSummary[0].msg) })));
   }
   lines.push('');
 
-  lines.splice(4, 0, '状态    ' + paintVerdict(verdict), dim('任务    运行 ' + (activity.turns.recentRunning ?? '—') + ' · 工具执行中 ' + (activity.tools.pending ?? '—') + ' · 队列 ' + (activity.queue.count ?? '—') + ' · 近10m ERROR ' + (activity.alerts.error10m ?? '—')));
+  lines.splice(4, 0, t('statusLabel') + paintVerdict(verdict), dim(t('taskStatus', { running: activity.turns.recentRunning ?? '—', tools: activity.tools.pending ?? '—', queue: activity.queue.count ?? '—', errors: activity.alerts.error10m ?? '—' })));
   const sampleMs = Date.now() - sampleStarted;
   const dashboard = { host, activity, performance: performanceCache, sys, tm, load, pressurePercent: pressurePct, swap, hist, now: NOW,
     probes: probeRes, storage: { dbBytes: dbTotal, walBytes: inv.filter(item => item.f.endsWith('-wal')).reduce((sum, item) => sum + item.s, 0), diskAvailable: dfAvail },
@@ -711,7 +726,7 @@ async function runOnce() {
     environment: { model, reasoning: reas, sandbox, cliVersion: cliVer },
     monitor: { pid: process.pid, rssBytes: process.memoryUsage().rss },
     sampleMs, intervalSeconds: interval, windowSeconds: uiState.windowSeconds };
-  return renderLast();
+  return !watch && !options.json ? renderLast() : '';
 }
 
 function renderLast() {
@@ -730,10 +745,11 @@ function renderLast() {
   else if (uiState.view === 'diagnostics') primary = original.slice(index('[3]'));
   else {
     primary = original.slice(6, index('[4]'));
-    const rows = original.slice(index('[4]'), index('[6]')).filter(line => /本地 IPC|数据目录|DB 文件|最大 DB|WAL|磁盘 |压缩内存|上下文/.test(line));
-    information.push({ title: '存储与本地链路', tag: 'STORAGE', tone: 'cyan', rows });
+    const storageLabels = ['localIpc', 'dataDirectory', 'dbFiles', 'largestDb', 'walBacklog', 'largestWal', 'diskFree', 'compressedMemory', 'contextWindow'].map(key => t(key).split('{')[0]);
+    const rows = original.slice(index('[4]'), index('[6]')).filter(line => storageLabels.some(label => line.includes(label)));
+    information.push({ title: t('storageLinkTitle'), tag: 'STORAGE', tone: 'cyan', rows });
   }
-  if (!layout.right) information.unshift({ title: '资源当前值', tag: 'VALUES', tone: 'cyan',
+  if (!layout.right) information.unshift({ title: t('resourceValuesTitle'), tag: 'VALUES', tone: 'cyan',
     rows: charts.sections.flatMap(section => section.metrics.map(metric => ({ label: metric.label, value: metric.value, tone: metric.tone }))) });
   if (!layout.right) information.push(systemStatus);
   let secondary = renderInformationSections(information, { width: layout.columns === 2 ? layout.secondary : layout.left, color: COLOR });
@@ -741,23 +757,23 @@ function renderLast() {
   if (uiState.showHelp) {
     pinned = [];
     primary = [
-      bold('Codex 监控 · 快捷键'), '',
-      '1 总览   2 主机   3 任务   4 诊断',
-      'Space / p    暂停或恢复采样',
-      '↑ ↓ / j k    滚动左侧信息；宽屏两栏同步滚动',
-      'PgUp PgDn    翻页滚动',
-      'g / Home     回到顶部',
-      '[ / ]        缩短或扩大趋势时间窗口',
-      'r            立即重新采集并刷新探针',
-      'h / ?        显示或关闭帮助',
-      'q / Ctrl-C   退出并恢复终端', '',
-      '右侧只显示主机和 Codex 趋势，列表及诊断在左侧。',
-      '终端达到 180 列时，左侧自动分成两栏。',
-      'Codex 数据只读；JSON 导出不包含消息、命令或日志正文。',
-      '内存为物理已用；RSS 求和包含共享页重复。',
-      'ps CPU 为系统平均值，全机/逐核 CPU 为区间采样。',
-      '缓存 ≈tok/s 保留测量时间，不代表当前生成速度。',
-      'HTTP 401/403 只表示收到了响应，不验证登录状态。',
+      bold(t('keysTitle')), '',
+      t('keysViews'),
+      t('keysPause'),
+      t('keysScroll'),
+      t('keysPage'),
+      t('keysHome'),
+      t('keysWindow'),
+      t('keysRefresh'),
+      t('keysHelp'),
+      t('keysQuit'), '',
+      t('helpLayout'),
+      t('helpColumns'),
+      t('helpReadOnly'),
+      t('helpMemory'),
+      t('helpCpu'),
+      t('helpSpeed'),
+      t('helpHttp'),
     ];
     secondary = [];
   }
@@ -769,30 +785,32 @@ function renderLast() {
   let right = [];
   if (layout.right) {
     const budget = frameRows ?? 60;
-    const status = fitRows(renderInformationSections([systemStatus], { width: layout.right, color: COLOR }), Math.max(1, Math.floor(budget / 4)), dim('… 拉高窗口查看全部逐核状态'));
+    const status = fitRows(renderInformationSections([systemStatus], { width: layout.right, color: COLOR }), Math.max(1, Math.floor(budget / 4)), dim(t('raiseWindow')));
     right = renderResourcePanel(charts, { width: layout.right, height: Math.max(0, budget - status.length - 1), color: COLOR, presentation: 'charts' }).concat('', status);
   }
   return composeColumns(left.rows, right, cols);
 }
 
 const HELP = [
-  'codex-monitor — 只读 Codex 本地监控台', '用法:',
-  '  codex-monitor                         实时监控（默认每 1 秒）',
-  '  codex-monitor --once                  单次状态',
-  '  node codex-status.mjs                  单次状态',
-  '  node codex-status.mjs -w               交互监控',
-  '  -i, --interval SEC                    刷新间隔，默认 1s',
-  '  --once                                单次输出并退出',
-  '  --view overview|host|tasks|diagnostics 启动页面',
-  '  --window SEC                          趋势窗口 10–3600s',
-  '  --interface NAME                      指定网络接口',
-  '  --threads N                           显示任务数 1–30',
-  '  --no-probes                           关闭全部外部探针（含公网IP/代理HTTPS）',
-  '  --metrics-db PATH                     可选数值快照库',
-  '  --json                                单次 JSON；-w 为 JSONL',
-  '  --color / --no-color                   强制颜色 / 无颜色',
-  '  -h, --help                            帮助', '',
-  '快捷键：1–4 切页 · Space 暂停 · ↑↓ 滚动 · [ ] 窗口 · r 刷新 · h 帮助 · q 退出',
+  t('helpTitle'), t('usage'),
+  t('usageCommand'),
+  t('usageOnceCommand'),
+  t('usageNode'),
+  t('usageNodeWatch'),
+  t('usageInterval'),
+  t('usageOnce'),
+  t('usageView'),
+  t('usageWindow'),
+  t('usageInterface'),
+  t('usageThreads'),
+  t('usageProbes'),
+  t('usageMetrics'),
+  t('usageJson'),
+  t('usageColor'),
+  t('usageLang'),
+  t('usageHelp'), '',
+  t('languageEnvironment'), '',
+  t('usageKeys'),
 ].join('\n');
 
 if (options.help) { console.log(HELP); process.exit(0); }
@@ -836,8 +854,8 @@ if (watch) {
       if (options.json) process.stdout.write(JSON.stringify(lastSnapshot) + '\n');
       else {
         const rendered = renderLast();
-        const footer = ' ' + Object.entries(VIEW_NAMES).map(([key, value], i) => (uiState.view === key ? '[' : '') + (i + 1) + ' ' + value + (uiState.view === key ? ']' : '')).join('  ')
-          + ' · ' + (uiState.paused ? '已暂停' : interval + 's') + ' · ↑↓滚动 ' + (uiState.leftOffset + 1) + '/' + lastLeftTotal + ' · h 帮助 · q 退出';
+        const footer = ' ' + Object.entries(getViewNames()).map(([key, value], i) => (uiState.view === key ? '[' : '') + (i + 1) + ' ' + value + (uiState.view === key ? ']' : '')).join('  ')
+          + ' · ' + (uiState.paused ? t('paused') : interval + 's') + t('scrollFooter') + (uiState.leftOffset + 1) + '/' + lastLeftTotal + t('keysFooter');
         const frame = rendered + '\n' + truncVis(dim(footer), process.stdout.columns || 110);
         process.stdout.write(terminal ? '\x1b[H' + frame.replace(/\n/g, '\x1b[K\n') + '\x1b[K\x1b[0J' : frame + '\n');
       }
@@ -846,7 +864,7 @@ if (watch) {
         wakeWatch = () => { clearTimeout(timeout); resolve(); };
       });
     }
-  } catch (error) { console.error('监控采集失败：' + error.message); process.exitCode = 1; }
+  } catch (error) { console.error(t('samplingFailed') + error.message); process.exitCode = 1; }
   finally {
     if (interactive) { process.stdin.off('data', onKey); process.stdin.setRawMode(Boolean(previousRaw)); process.stdin.pause(); }
     if (terminal) process.stdout.write('\x1b[?7h\x1b[?25h\x1b[?1049l');
@@ -857,6 +875,6 @@ if (watch) {
   try {
     const rendered = await runOnce();
     process.stdout.write(options.json ? JSON.stringify(lastSnapshot, null, 2) + '\n' : rendered + '\n');
-  } catch (error) { console.error('监控采集失败：' + error.message); process.exitCode = 1; }
+  } catch (error) { console.error(t('samplingFailed') + error.message); process.exitCode = 1; }
   finally { closeDatabases(); }
 }

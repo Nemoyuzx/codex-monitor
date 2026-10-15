@@ -1,5 +1,7 @@
 # codex-monitor
 
+[简体中文](README.md) · [English](README.en.md)
+
 只读的本地 Codex 终端监控台：主机资源、聊天与工具活动、进程、网络及真实代理出口检测。独立社区项目，与 OpenAI 无官方隶属关系。
 
 Read-only local Codex terminal dashboard for macOS. Live resource charts, activity summaries, and real HTTPS proxy egress checks, with no third-party npm runtime dependencies.
@@ -41,6 +43,23 @@ codex-monitor -w --json              # 持续 JSONL
 开发测试另外需要 `openssl`、本地回环端口监听权限。所有测试使用临时文件、内存数据库或本机服务，不要求 Codex 账号，也不依赖公网。Node 24/26 的自动测试见 [GitHub Actions](https://github.com/Nemoyuzx/codex-monitor/actions)。
 
 当前版本还没有独立桌面应用；命令需要终端和 Node.js 运行时。SQLite 数据结构属于 Codex 内部实现，后续版本可能变化，无法读取的字段会显示未知。
+
+## 界面语言
+
+支持简体中文（`zh-CN`）、繁體中文（`zh-TW`）、English（`en`）和日本語（`ja`）。帮助、参数错误、页面标题、状态提示和图表标签随所选语言切换：
+
+```sh
+codex-monitor --lang en                  # 英语
+codex-monitor --lang=zh-TW                # 繁体中文
+codex-monitor --language ja               # 日语；--language 是 --lang 的别名
+CODEX_MONITOR_LANG=zh-CN codex-monitor    # 用环境变量固定简体中文
+codex-monitor --lang auto                 # 自动选择（默认）
+codex-monitor --help --lang en            # 英语帮助
+```
+
+显式 `--lang` 优先。自动选择按 `CODEX_MONITOR_LANG` → `LC_ALL` → `LC_MESSAGES` → `LANG` 取第一个非空、非 `auto` 的值；未设置或该值不受支持时使用英语。兼容 `en_US.UTF-8`、`zh-Hans`、`zh-Hant` 和 `ja-JP` 等系统语言标记；`C` / `POSIX` 使用英语。显式指定不支持的语言会报错，不会悄悄改用其他语言。
+
+只翻译内置界面文字。聊天内容、标题、工具名、命令、原始日志和系统返回值保留原样，JSON 字段名与原始数据不随界面语言变化。
 
 ## 用法
 

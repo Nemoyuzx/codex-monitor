@@ -100,3 +100,46 @@ test('reading leaves the metrics database byte for byte unchanged', t => {
   assert.equal(read.byThread[ID].fields.outputTokens.value, 500);
   assert.deepEqual(fs.readFileSync(file), before);
 });
+
+test('freshness falls back across fields without reviving older values of a malformed latest field', t => {
+  const { file, put } = fixture(t);
+  put('rounds', 4, { at: NOW - 3_000 });
+  put('rounds', 1.5, { at: NOW - 1_000 });
+  put('outputTokens', 500, { at: NOW - 10_000 });
+  put('private-content', 10, { at: NOW });
+  put('steps', 3, { at: NOW + 1 });
+  const result = readPerformanceMetrics({ dbPath: file, now: NOW });
+  assert.equal(result.available, true);
+  assert.equal(result.measuredAt, NOW - 10_000);
+  assert.equal(result.sourceAge, 10_000);
+  assert.deepEqual(Object.keys(result.byThread), []);
+});
+
+test('freshness retains the per-field lookup choice when equal timestamps have different validity', t => {
+  const { file, db, put } = fixture(t);
+  put('rounds', 5.5, { at: NOW - 1_000 });
+  put('rounds', 4, { scope: 'another-scope', at: NOW - 1_000 });
+  put('steps', 3, { at: NOW - 10_000 });
+  const check = () => {
+    // Match the reader's existing per-field query, including a source's indexes.
+    const latest = db.prepare('SELECT value,measured_at FROM thread_metric_values WHERE field=? AND measured_at<=? ORDER BY measured_at DESC LIMIT 1').get('rounds', NOW);
+    const expected = Number.isSafeInteger(latest.value) ? latest.measured_at : NOW - 10_000;
+    assert.equal(readPerformanceMetrics({ dbPath: file, now: NOW }).measuredAt, expected);
+  };
+  check();
+  // Index ordering can choose another tied row; the freshness fast path must
+  // still agree with the original field-specific lookup.
+  db.exec('CREATE INDEX metric_field_time ON thread_metric_values(field,measured_at DESC,value)');
+  check();
+});
+
+test('freshness stays unavailable when every newest known field is invalid', t => {
+  const { file, put } = fixture(t);
+  for (const field of ['rounds', 'steps', 'llmDurationMs', 'toolDurationMs', 'firstTokenAvgMs', 'tokensPerSecond', 'cacheHitPercent', 'inputTokens', 'outputTokens']) {
+    put(field, -1);
+  }
+  const result = readPerformanceMetrics({ dbPath: file, now: NOW });
+  assert.equal(result.available, true);
+  assert.equal(result.measuredAt, null);
+  assert.equal(result.sourceAge, null);
+});

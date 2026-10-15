@@ -1,4 +1,8 @@
 // Pure terminal rendering: no sampling, subprocesses, or access to Codex data.
+import { createTranslator, withLocale } from './i18n.mjs';
+import catalog from './locales/resource.mjs';
+
+const t = createTranslator(catalog);
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g;
 const BRAILLE = [[1, 2, 4, 64], [8, 16, 32, 128]];
 
@@ -39,7 +43,7 @@ export function columnWidths(cols) {
   return { left, right: cols - left - 3 };
 }
 
-export function fitRows(rows, limit, omission = '… 已折叠部分内容，拉高窗口可看全 …') {
+export function fitRows(rows, limit, omission = t('folded')) {
   if (!Number.isFinite(limit) || rows.length <= limit) return rows;
   if (limit <= 0) return [];
   if (limit < 10) return rows.slice(0, limit - 1).concat(omission);
@@ -115,7 +119,12 @@ export function historyStats(values, times, { now, windowSeconds }) {
 // first; optional items are hidden before required items at the same size.
 // presentation: 'charts' reserves the panel for trends. Text rows and footers
 // belong in the adjacent detail pane; chart height grows with available space.
-export function renderResourcePanel({ sections = [], times = [], now, windowSeconds }, { width, height = 60, color = false, presentation }) {
+export function renderResourcePanel(model, options = {}) {
+  const locale = options.locale ?? model.locale;
+  return locale ? withLocale(locale, () => renderPanel(model, options)) : renderPanel(model, options);
+}
+
+function renderPanel({ sections = [], times = [], now, windowSeconds }, { width, height = 60, color = false, presentation }) {
   width = Math.max(0, Math.floor(width));
   height = Math.max(0, Math.floor(height));
   if (!width || !height) return [];
@@ -126,6 +135,22 @@ export function renderResourcePanel({ sections = [], times = [], now, windowSeco
   const paired = inner >= 74;
   const chartsOnly = presentation === 'charts';
   const metricWidth = paired ? Math.floor((inner - 3) / 2) : inner;
+  // Layout fitting can try several heights and remove many optional items. A
+  // metric's samples do not change during a render, so reuse its plots and
+  // statistics across those attempts instead of scanning history repeatedly.
+  const graphs = new Map(), statistics = new Map();
+  const metricGraph = (metric, graphHeight) => {
+    let byHeight = graphs.get(metric);
+    if (!byHeight) graphs.set(metric, byHeight = new Map());
+    if (!byHeight.has(graphHeight)) byHeight.set(graphHeight, historyGraph(metric.values || [], times, {
+      width: metricWidth, height: graphHeight, now, windowSeconds, ...metric.scale,
+    }));
+    return byHeight.get(graphHeight);
+  };
+  const metricStats = metric => {
+    if (!statistics.has(metric)) statistics.set(metric, historyStats(metric.values || [], times, { now, windowSeconds }));
+    return statistics.get(metric);
+  };
   const align = (left, right, w) => {
     const rhs = truncVis(right, w);
     const room = Math.max(0, w - visLen(rhs) - 1);
@@ -137,7 +162,7 @@ export function renderResourcePanel({ sections = [], times = [], now, windowSeco
     return muted('[') + paint(tones[tone] || 36, '━'.repeat(filled)) + muted('·'.repeat(length - filled) + ']');
   };
   const timeAxis = w => {
-    const left = '−' + duration(windowSeconds), middle = '−' + duration(windowSeconds / 2), right = '现在';
+    const left = '−' + duration(windowSeconds), middle = '−' + duration(windowSeconds / 2), right = t('now');
     const center = Math.floor((w - visLen(middle)) / 2);
     return padVis(left, center) + padVis(middle, w - center - visLen(right)) + right;
   };
@@ -149,10 +174,14 @@ export function renderResourcePanel({ sections = [], times = [], now, windowSeco
     priority: (Number(sections[entry.sectionIndex].priority) || 0) + (Number(entry.item?.priority) || 0),
     optional: Boolean(sections[entry.sectionIndex].optional || entry.item?.optional),
   }));
+  const hidden = (charts, rows, includeZero = false) => t('hidden', { items: [
+    (charts || includeZero) && t(charts === 1 ? 'hiddenChart' : 'hiddenCharts', { count: charts }),
+    (rows || includeZero) && t(rows === 1 ? 'hiddenRow' : 'hiddenRows', { count: rows }),
+  ].filter(Boolean).join(t('listSeparator')) });
   const omitted = selected => {
     const charts = items.filter(item => item.kind === 'metric' && !selected.has(item)).length;
     const rows = items.filter(item => item.kind === 'row' && !selected.has(item)).length;
-    return charts || rows ? `… 已隐藏 ${[charts && `${charts} 图`, rows && `${rows} 行`].filter(Boolean).join('、')} · 拉高窗口或切换视图` : '';
+    return charts || rows ? t('hiddenHint', { notice: hidden(charts, rows) }) : '';
   };
   const layouts = [
     { graphHeight: 5, details: true, stats: true, timeline: true, separators: true, footer: true },
@@ -163,7 +192,7 @@ export function renderResourcePanel({ sections = [], times = [], now, windowSeco
     { graphHeight: 2 },
   ];
   const build = ({ graphHeight, details, stats, timeline, separators, footer }, selected) => {
-    const rows = [align(paint('1;36', '资源监视'), muted('最近 ' + duration(windowSeconds)), width)];
+    const rows = [align(paint('1;36', t('title')), muted(t('recent', { duration: duration(windowSeconds) })), width)];
     for (const [sectionIndex, section] of sections.entries()) {
       const members = items.filter(item => item.sectionIndex === sectionIndex && selected.has(item));
       if (!members.length) continue;
@@ -188,11 +217,11 @@ export function renderResourcePanel({ sections = [], times = [], now, windowSeco
               : muted(truncVis(metric.detail || '', metricWidth)));
           }
           if (graphHeight) {
-            const graph = historyGraph(metric.values || [], times, { width: metricWidth, height: graphHeight, now, windowSeconds, ...metric.scale });
+            const graph = metricGraph(metric, graphHeight);
             result.push(...graph.map(row => muted(row.axis) + paint(c, row.plot)));
           }
           if (stats && metric.stats !== false) {
-            const observed = historyStats(metric.values || [], times, { now, windowSeconds });
+            const observed = metricStats(metric);
             const format = metric.statsFormat || metric.scale?.format || compactNumber;
             const number = value => value == null ? '—' : format(value);
             result.push(muted(`min ${number(observed.min)} · max ${number(observed.max)} · avg ${number(observed.avg)}`));
@@ -216,7 +245,7 @@ export function renderResourcePanel({ sections = [], times = [], now, windowSeco
       if (footer && section.footer) body(muted(section.footer));
       rows.push(border('└' + '─'.repeat(width - 2) + '┘'));
     }
-    if (footer && items.some(item => item.kind === 'metric' && selected.has(item))) rows.push(muted('CPU / 内存  ') + paint(32, '低') + muted(' · ') + paint(33, '中') + muted(' · ') + paint(31, '高'));
+    if (footer && items.some(item => item.kind === 'metric' && selected.has(item))) rows.push(muted(t('legend')) + paint(32, t('low')) + muted(' · ') + paint(33, t('medium')) + muted(' · ') + paint(31, t('high')));
     const notice = omitted(selected);
     if (notice) rows.push(muted(notice));
     return rows;
@@ -281,11 +310,11 @@ export function renderResourcePanel({ sections = [], times = [], now, windowSeco
   // Very small sizes use a frameless preview so neither a partial box nor an
   // out-of-bounds axis can corrupt the adjacent terminal column.
   const best = [...items].filter(item => item.kind === 'metric').sort((a, b) => Number(a.optional) - Number(b.optional) || b.priority - a.priority || a.order - b.order)[0];
-  const tiny = [paint('1;36', '资源监视')];
+  const tiny = [paint('1;36', t('title'))];
   if (best && height >= 3) {
     tiny.push(align(best.item.label, best.item.value, width));
     if (height >= 4) tiny.push(...historyGraph(best.item.values || [], times, { width, height: 1, now, windowSeconds, ...best.item.scale }).map(row => muted(row.axis) + paint(tones[best.item.tone] || 36, row.plot)));
-    tiny.push(muted(omitted(new Set([best])) || '拉高窗口查看完整趋势'));
-  } else if (height > 1) tiny.push(muted(`… 已隐藏 ${items.filter(item => item.kind === 'metric').length} 图、${items.filter(item => item.kind === 'row').length} 行`));
+    tiny.push(muted(omitted(new Set([best])) || t('trendsHint')));
+  } else if (height > 1) tiny.push(muted(hidden(items.filter(item => item.kind === 'metric').length, items.filter(item => item.kind === 'row').length, true)));
   return bound(tiny);
 }
