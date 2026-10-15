@@ -127,12 +127,63 @@ test('network follows real default interface, computes separate timed directions
   assert.equal(sampler.sample().network.inRate, null);
 });
 
-test('explicit network interface never silently falls back to another interface', () => {
-  const { sampler } = fixture({ sampler: { interfaceName: 'en99' } });
+test('default route refreshes independently while the old network interface still exists', () => {
+  const { sampler, state } = fixture({ net: [net('en7', 100, 200), net('en8', 90000, 90000)].join('\n') });
+  assert.equal(sampler.sample().network.interfaceName, 'en7');
+  state.route = 'interface: en8';
+  state.at = 999;
+  assert.equal(sampler.sample().network.interfaceName, 'en7');
+  assert.equal(state.calls.filter(([file]) => file === 'route').length, 1);
+  state.at = 1000;
+  assert.equal(sampler.sample().network.interfaceName, 'en8');
+  assert.equal(state.calls.filter(([file]) => file === 'route').length, 2);
+  assert.equal(state.calls.filter(([file]) => file === 'pmset').length, 1);
+  assert.equal(state.calls.filter(([file]) => file === 'sysctl').length, 1);
+});
+
+test('a missing cached route interface triggers discovery before its configured TTL', () => {
+  const { sampler, state } = fixture({ net: [net('en7', 100, 200), net('en8', 300, 400)].join('\n'), sampler: { routeIntervalMs: 60_000 } });
+  assert.equal(sampler.sample().network.interfaceName, 'en7');
+  state.at = 100;
+  state.route = 'interface: en8';
+  state.net = net('en8', 400, 500);
+  assert.equal(sampler.sample().network.interfaceName, 'en8');
+  assert.equal(state.calls.filter(([file]) => file === 'route').length, 2);
+  state.at = 200;
+  sampler.sample();
+  assert.equal(state.calls.filter(([file]) => file === 'route').length, 2);
+});
+
+test('failed default-route discovery stays unknown and recovers without guessing from cumulative traffic', () => {
+  const { sampler, state } = fixture({ net: [net('en7', 100, 200), net('utun4', 90000, 90000)].join('\n') });
+  assert.equal(sampler.sample().network.interfaceName, 'en7');
+  state.at = 1000;
+  state.fail = ['route'];
+  const unavailable = sampler.sample().network;
+  assert.equal(unavailable.interfaceName, null);
+  assert.equal(unavailable.inBytes, null);
+  assert.equal(unavailable.outBytes, null);
+  assert.equal(unavailable.inRate, null);
+  assert.equal(unavailable.outRate, null);
+  assert.equal(unavailable.interfaces.length, 2);
+  state.at = 2000;
+  state.fail = [];
+  state.route = 'interface: utun4';
+  assert.equal(sampler.sample().network.interfaceName, 'utun4');
+});
+
+test('explicit network interface never queries the default route or silently falls back to another interface', () => {
+  const { sampler, state } = fixture({ sampler: { interfaceName: 'en99' } });
   const { network } = sampler.sample();
   assert.equal(network.interfaceName, 'en99');
   assert.equal(network.inBytes, null);
   assert.equal(network.inRate, null);
+  state.at = 30_000;
+  sampler.sample();
+  assert.equal(state.calls.filter(([file]) => file === 'route').length, 0);
+  const explicit = fixture({ net: [net('en7', 100, 200), net('en8', 300, 400)].join('\n'), sampler: { interfaceName: 'en8' } });
+  assert.equal(explicit.sampler.sample().network.interfaceName, 'en8');
+  assert.equal(explicit.state.calls.filter(([file]) => file === 'route').length, 0);
 });
 
 test('disk parser reads each driver dictionary rather than maxima or APFS child counters', () => {

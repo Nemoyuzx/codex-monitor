@@ -1,4 +1,4 @@
-import { charW, visLen, truncVis, padVis } from './resource-panel.mjs';
+import { charW, visLen, truncVis, padVis, terminalTokens } from './resource-panel.mjs';
 
 // A wide terminal has two information columns on the left and a separate plot
 // pane. Keep enough plot width for two legible charts beside each other.
@@ -16,23 +16,33 @@ export function wrapTerminalLine(text, width) {
   if (width <= 0) return [];
   const rows = [];
   let line = '', used = 0, style = '';
-  const tokens = String(text).match(/\x1b\[[0-9;?]*[A-Za-z]|[\s\S]/gu) || [];
-  for (const token of tokens) {
-    if (token.startsWith('\x1b')) {
-      line += token;
-      if (token.endsWith('m')) style = token === '\x1b[0m' || token === '\x1b[m' ? '' : style + token;
+  let retained = false;
+  const updateStyle = token => {
+    if (!token.includes('\x1b')) return;
+    for (const code of token.match(/\x1b\[[0-9;?]*m/g) || []) {
+      style = code === '\x1b[0m' || code === '\x1b[m' ? '' : style + code;
+    }
+  };
+  for (const token of terminalTokens(text)) {
+    const size = charW(token);
+    if (size > width) {
+      // An over-wide grapheme is omitted as a whole, while its color changes
+      // still apply to following text. It must not create an empty row.
+      const codes = token.match(/\x1b\[[0-9;?]*[A-Za-z]/g)?.join('') || '';
+      line += codes;
+      updateStyle(codes);
       continue;
     }
-    const size = charW(token);
     if (used + size > width) {
       rows.push(line + (style ? '\x1b[0m' : ''));
       line = style;
       used = 0;
     }
-    if (size > width) continue;
     line += token; used += size;
+    if (!token.startsWith('\x1b') || size) retained = true;
+    updateStyle(token);
   }
-  rows.push(line);
+  if (retained || String(text) === '') rows.push(line);
   return rows;
 }
 

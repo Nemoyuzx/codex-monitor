@@ -7,16 +7,26 @@ const MAX_THREADS = 256;
 const MAX_ITEMS_PER_THREAD = 10_000;
 const MAX_DURATION_SAMPLES = 2_000;
 const schemas = new WeakMap();
-const SCHEMA_KEY = Symbol('schemaKey');
+const READER_STATE = Symbol('readerState');
 
-function trackedReader(db, source, failures) {
+function trackedReader(db, source, failures, readers) {
   if (!db) return null;
+  let shared = readers.get(db);
+  if (!shared) {
+    shared = { statements: new Map(), schemaChecked: false, schemaFailed: false, tables: null };
+    readers.set(db, shared);
+  }
   return {
-    [SCHEMA_KEY]: db,
+    [READER_STATE]: { db, shared, source, failures },
     prepare(sql) {
       return {
         all(...args) {
-          try { return db.prepare(sql).all(...args); }
+          try {
+            // A sample reuses its small fixed SQL set, including when several
+            // projections share a connection. Nothing survives into the next sample.
+            if (!shared.statements.has(sql)) shared.statements.set(sql, db.prepare(sql));
+            return shared.statements.get(sql).all(...args);
+          }
           catch (error) { failures.add(source); throw error; }
         },
       };
@@ -26,9 +36,26 @@ function trackedReader(db, source, failures) {
 
 function columns(db, table) {
   if (!db) return new Set();
-  const schemaKey = db[SCHEMA_KEY] || db;
-  let tables = schemas.get(schemaKey);
-  if (!tables) { tables = new Map(); schemas.set(schemaKey, tables); }
+  const reader = db[READER_STATE];
+  const { shared } = reader;
+  if (!shared.schemaChecked) {
+    shared.schemaChecked = true;
+    try {
+      const version = db.prepare('PRAGMA schema_version').all()[0]?.schema_version;
+      if (!Number.isSafeInteger(version)) throw new Error('Unavailable schema version');
+      let schema = schemas.get(reader.db);
+      if (!schema || schema.version !== version) {
+        schema = { version, tables: new Map() };
+        schemas.set(reader.db, schema);
+      }
+      shared.tables = schema.tables;
+    } catch { shared.schemaFailed = true; }
+  }
+  if (shared.schemaFailed) {
+    reader.failures.add(reader.source);
+    return new Set();
+  }
+  const tables = shared.tables;
   if (!tables.has(table)) {
     try { tables.set(table, new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name))); }
     catch { return new Set(); } // Retry transient schema-query failures on the next sample.
@@ -86,11 +113,12 @@ export function collectActivity({ historyDb = null, stateDb = null, logsDb = nul
   limit = Math.max(1, Math.min(32, Math.trunc(Number(threads)) || 8));
   const cutoff = now - HOUR;
   const queryFailures = new Set();
-  historyDb = trackedReader(historyDb, 'history', queryFailures);
-  stateDb = trackedReader(stateDb, 'state', queryFailures);
-  logsDb = trackedReader(logsDb, 'logs', queryFailures);
-  queueDb = trackedReader(queueDb, 'queue', queryFailures);
-  goalsDb = trackedReader(goalsDb, 'goals', queryFailures);
+  const readers = new Map();
+  historyDb = trackedReader(historyDb, 'history', queryFailures, readers);
+  stateDb = trackedReader(stateDb, 'state', queryFailures, readers);
+  logsDb = trackedReader(logsDb, 'logs', queryFailures, readers);
+  queueDb = trackedReader(queueDb, 'queue', queryFailures, readers);
+  goalsDb = trackedReader(goalsDb, 'goals', queryFailures, readers);
   const availability = {
     history: has(historyDb, 'thread_items', ['thread_id', 'turn_id', 'item_id', 'item_type', 'rollout_ordinal', 'created_at_ms', 'started_at_ms', 'completed_at_ms', 'item_json']),
     state: has(stateDb, 'threads', ['id']),
@@ -154,7 +182,13 @@ export function collectActivity({ historyDb = null, stateDb = null, logsDb = nul
       }
     }
     // Also cover completed/failed turns when the state DB is missing or delayed.
-    const recent = query(historyDb, `SELECT thread_id, MAX(started_at) AS last_start FROM thread_turns WHERE (CASE WHEN started_at<100000000000 THEN started_at*1000 ELSE started_at END)>=? GROUP BY thread_id ORDER BY last_start DESC LIMIT ?`, cutoff, MAX_THREADS + 1);
+    // Separate ranges let an existing started_at index skip historical turns.
+    // Keep the original conversion as the final check: flooring the seconds
+    // prefilter admits fractional boundary values without changing membership.
+    const recent = query(historyDb, `SELECT thread_id, MAX(started_at) AS last_start FROM thread_turns
+      WHERE ((started_at>=? AND started_at<100000000000) OR (started_at>=? AND started_at>=100000000000))
+      AND (CASE WHEN started_at<100000000000 THEN started_at*1000 ELSE started_at END)>=?
+      GROUP BY thread_id ORDER BY last_start DESC LIMIT ?`, Math.floor(cutoff / 1000), cutoff, cutoff, MAX_THREADS + 1);
     if (recent.length > MAX_THREADS) Object.assign(result.coverage, { complete: false, recentToolsComplete: false, pendingComplete: false });
     for (const row of recent.slice(0, MAX_THREADS)) if (!candidates.has(row.thread_id)) {
       const state = availability.state ? get(stateDb, `SELECT ${threadFields} FROM threads WHERE id=?`, row.thread_id) : null;

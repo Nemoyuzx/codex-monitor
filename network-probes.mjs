@@ -154,6 +154,9 @@ export function createNetworkProbeSampler({ now = Date.now, run = defaultRun, en
     provenance: { measurement: 'anonymous HTTPS GET; cumulative request timings, not ping RTT' } });
   const collect = async (networkDetails, environment, selected, signal) => {
     const started = now();
+    const requestEnvironment = cleanEnvironment(environment);
+    const pacFlag = networkDetails?.systemProxy?.pac?.enabled;
+    const pacEnabled = typeof pacFlag === 'boolean' ? pacFlag : null;
     const routes = [{ kind: 'direct', label: '直连（系统路由）', endpoint: null, sources: ['direct'] }, ...selected];
     const requests = routes.flatMap(route => ['ip', 'connectivity'].map(type => ({ route, type })));
     const responses = new Map(routes.map(route => [route, {}]));
@@ -171,7 +174,7 @@ export function createNetworkProbeSampler({ now = Date.now, run = defaultRun, en
         let result;
         try {
           result = await run(curlPath, args, { input: route.credentials ? `proxy-user = ${quoteConfig(route.credentials)}\n` : '',
-            env: cleanEnvironment(environment), timeoutMs: requestTimeout + 500, maxBuffer: BODY_LIMIT + 2048, signal });
+            env: requestEnvironment, timeoutMs: requestTimeout + 500, maxBuffer: BODY_LIMIT + 2048, signal });
         } catch { result = { exitCode: null, aborted: signal.aborted }; }
         responses.get(route)[type] = parseOutput(result, { target: targets[type], type, proxy: !!route.endpoint, sampledAt: now() });
       }
@@ -184,8 +187,7 @@ export function createNetworkProbeSampler({ now = Date.now, run = defaultRun, en
         publicIp: results.ip?.publicIp || null, ipLookup: results.ip || null, connectivity: results.connectivity || null };
     };
     return { sampledAt: now(), startedAt: started, disabled: false, direct: summary(routes[0]), proxies: routes.slice(1).map(summary),
-      pac: { enabled: networkDetails?.systemProxy?.pac?.enabled === true,
-        status: networkDetails?.systemProxy?.pac?.enabled === true ? 'unresolved' : 'disabled' },
+      pac: { enabled: pacEnabled, status: pacEnabled === true ? 'unresolved' : pacEnabled === false ? 'disabled' : 'unknown' },
       provenance: { measurement: 'anonymous HTTPS GET; cumulative request timings, not ping RTT', directUsesSystemRoute: true,
         tlsVerification: 'enabled', targets: [...new Set(Object.values(targets).map(target => new URL(target).hostname))], ttlMs, maxRequests: 10, concurrency: maxConcurrent,
         bypassRulesApplied: false, redirectsFollowed: false } };

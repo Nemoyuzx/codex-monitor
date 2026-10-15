@@ -200,9 +200,9 @@ export function parsePowerSnapshot(text) {
  * Disk counters cover IOBlockStorageDriver devices, including attached disk images.
  */
 export function createHostSampler({ interfaceName, now = Date.now, run = defaultRun, cpus = os.cpus, pid = process.pid,
-  platform = process.platform, topLimit = 5, peripheralIntervalMs = 30_000 } = {}) {
+  platform = process.platform, topLimit = 5, peripheralIntervalMs = 30_000, routeIntervalMs = 1000 } = {}) {
   let previousCpu = null, previousNetwork = null, previousDisk = null;
-  let peripheralAt = null, routeInterface = null, power = null, pressure = null;
+  let peripheralAt = null, routeAt = null, routeInterface = null, power = null, pressure = null;
   const read = (file, args) => { try { const value = run(file, args); return typeof value === 'string' ? value : String(value || ''); } catch { return ''; } };
   return { sample() {
     const at = now();
@@ -213,21 +213,26 @@ export function createHostSampler({ interfaceName, now = Date.now, run = default
     const psText = read('ps', ['-axo', 'pid=,ppid=,pcpu=,rss=,etime=,command=']);
     const processes = summarizeProcesses(psText, pid, Math.max(1, Math.floor(topLimit)));
     if (platform === 'darwin' && (peripheralAt === null || at - peripheralAt >= peripheralIntervalMs || at < peripheralAt)) {
-      if (!interfaceName) routeInterface = (read('route', ['-n', 'get', 'default']).match(/^\s*interface:\s*(\S+)/m) || [])[1] || null;
       power = parsePowerSnapshot(read('pmset', ['-g', 'batt']));
       const level = Number(read('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level']).trim());
       pressure = [1, 2, 4].includes(level) ? { level, state: ({ 1: 'normal', 2: 'warning', 4: 'critical' })[level] } : null;
       peripheralAt = at;
     }
     const counters = platform === 'darwin' ? parseNetworkSnapshot(read('netstat', ['-ibn'])) : [];
+    // Route changes are independent of the slower power/pressure cache. If the cached
+    // interface vanishes, discover its replacement without waiting for the route TTL.
+    const routeMissing = routeInterface !== null && !counters.some(entry => entry.name === routeInterface);
+    if (platform === 'darwin' && !interfaceName && (routeAt === null || at - routeAt >= routeIntervalMs || at < routeAt || routeMissing)) {
+      routeInterface = (read('route', ['-n', 'get', 'default']).match(/^\s*interface:\s*(\S+)/m) || [])[1] || null;
+      routeAt = at;
+    }
     const seconds = previousNetwork ? (at - previousNetwork.at) / 1000 : null;
     const interfaces = counters.map(current => {
       const previous = previousNetwork?.interfaces.find(entry => entry.name === current.name);
       return { ...current, inRate: rate(current.inBytes, previous?.inBytes, seconds), outRate: rate(current.outBytes, previous?.outBytes, seconds) };
     });
     const selected = interfaces.find(entry => entry.name === interfaceName)
-      || (!interfaceName && interfaces.find(entry => entry.name === routeInterface))
-      || (!interfaceName && interfaces.filter(entry => entry.name !== 'lo0').toSorted((a, b) => b.inBytes + b.outBytes - a.inBytes - a.outBytes)[0]);
+      || (!interfaceName && interfaces.find(entry => entry.name === routeInterface));
     const network = { interfaceName: selected?.name || interfaceName || routeInterface || null,
       inBytes: selected?.inBytes ?? null, outBytes: selected?.outBytes ?? null, inRate: selected?.inRate ?? null, outRate: selected?.outRate ?? null, interfaces };
     previousNetwork = counters.length ? { at, interfaces: counters } : null;

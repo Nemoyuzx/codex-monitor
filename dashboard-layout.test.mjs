@@ -27,6 +27,25 @@ test('wrapping preserves long Chinese and colored content without overflowing', 
   }
 });
 
+test('wrapping keeps emoji and combining graphemes intact across ANSI color changes', () => {
+  const strip = value => value.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+  for (const cluster of ['👩‍💻', '👨‍👩‍👧‍👦', '👋🏽', '🇨🇳', '1️⃣', '☑️', 'か\u3099', '가']) {
+    assert.deepEqual(wrapTerminalLine(cluster + 'X', 2), [cluster, 'X']);
+    assert.deepEqual(wrapTerminalLine('A' + cluster + 'B', 1), ['A', 'B']);
+  }
+  const colored = '\x1b[35m👩\x1b[36m‍💻\x1b[0mX';
+  assert.deepEqual(wrapTerminalLine(colored, 2).map(strip), ['👩‍💻', 'X']);
+  const accent = '\x1b[35me\x1b[36m\u0301\x1b[0mX';
+  assert.deepEqual(wrapTerminalLine(accent, 1).map(strip), ['e\u0301', 'X']);
+});
+
+test('too-wide graphemes are omitted without producing empty row chains', () => {
+  assert.deepEqual(wrapTerminalLine('中文', 1), []);
+  assert.deepEqual(wrapTerminalLine('か\u3099👩‍💻', 1), []);
+  assert.deepEqual(wrapTerminalLine('', 1), [''], 'explicit blank rows stay blank');
+  assert.deepEqual(wrapTerminalLine('中文a中文b中文', 1), ['a', 'b']);
+});
+
 test('details retain both task names and long values rather than truncating the name away', () => {
   const name = '正在执行的任务完整名称';
   const value = '运行 12m20s · gpt-6.1-sol · 最近活动 2s前';

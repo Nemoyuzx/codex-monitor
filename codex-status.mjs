@@ -11,15 +11,15 @@
 //   node codex-status.mjs --no-color     # 关闭颜色
 //   CODEX_HOME=/path/.codex node codex-status.mjs -w
 
-import { discoverDatabase } from './database-discovery.mjs';
-import { execSync, execFileSync, execFile } from 'node:child_process';
+import { createDatabaseRegistry } from './database-discovery.mjs';
+import { execSync, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import { fitRows, truncVis, padVis, renderResourcePanel } from './resource-panel.mjs';
 import { dashboardLayout, renderInformationSections, composeInformationPane } from './dashboard-layout.mjs';
 import { createHostSampler } from './host-metrics.mjs';
+import { createTopSampler } from './top-sampler.mjs';
 import { createActivityCollector } from './activity-metrics.mjs';
 import { createNetworkDetailsSampler } from './network-details.mjs';
 import { createNetworkProbeSampler } from './network-probes.mjs';
@@ -31,7 +31,8 @@ import { createTranslator, getLocale, setLocale, resolveLocale, formatAgo } from
 import { statusMessages } from './locales/status.mjs';
 
 const t = createTranslator(statusMessages);
-const execFileAsync = promisify(execFile);
+const shutdown = new AbortController();
+const topSampler = createTopSampler();
 
 let options;
 try { options = parseOptions(process.argv.slice(2)); setLocale(options.lang); }
@@ -56,7 +57,7 @@ const networkProbeController = createBackgroundProbes({
 });
 const legacyProbeController = createBackgroundProbes({
   enabled: !options.noProbes, ttlMs: 10_000,
-  sample: () => getProbes(), cancel: () => legacyProbeAbort?.abort(), onUpdate: publishProbeState,
+  sample: (_, { force }) => getProbes(force), cancel: () => legacyProbeAbort?.abort(), onUpdate: publishProbeState,
 });
 function publishProbeState() {
   if (uiState.paused) return;
@@ -114,15 +115,21 @@ function paintVerdict(key) {
 function all(db, sql, ...a) { try { return db.prepare(sql).all(...a); } catch { return []; } }
 function one(db, sql, ...a) { try { return db.prepare(sql).get(...a) ?? null; } catch { return null; } }
 
-function discover(prefix, table) {
-  return discoverDatabase({ home: CODEX_HOME, prefix, table });
+const sourceRegistry = createDatabaseRegistry({ home: CODEX_HOME, sources: {
+  history: { prefix: 'thread_history_', table: 'thread_items' },
+  state: { prefix: 'state_', table: 'threads' },
+  logs: { prefix: 'logs_', table: 'logs' },
+  queue: { prefix: 'queue_', table: 'queued_items' },
+  goals: { prefix: 'goals_', table: 'thread_goals' },
+} });
+let { history: TH, state: ST, logs: LG, queue: Q, goals: G } = sourceRegistry.refresh();
+function refreshSources(force) {
+  const next = sourceRegistry.refresh({ force });
+  const sources = [next.history, next.state, next.logs, next.queue, next.goals];
+  if ([TH, ST, LG, Q, G].some((source, index) => source !== sources[index])) performanceCacheAt = 0;
+  if (LG !== next.logs) { lastLogId = null; lastLogAt = null; }
+  ({ history: TH, state: ST, logs: LG, queue: Q, goals: G } = next);
 }
-
-const TH = discover('thread_history_', 'thread_items');
-const ST = discover('state_', 'threads');
-const LG = discover('logs_', 'logs');
-const Q = discover('queue_', 'queued_items');
-const G = discover('goals_', 'thread_goals');
 
 // ---- config.toml（缓存，只读一次） ----
 let CONFIG_TEXT = null;
@@ -262,7 +269,7 @@ function memUsedPct() {
   return m ? 100 - Number(m[1]) : -1;
 }
 function fmtRate(n) {
-  if (n == null || isNaN(n) || n < 0) return '0';
+  if (!Number.isFinite(n) || n < 0) return '—';
   if (n >= 1e9) return (n / 1e9).toFixed(1) + 'G';
   if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
@@ -284,52 +291,6 @@ function parseSwap() {
   const mult = { B: 1, K: 1024, M: 1048576, G: 1073741824, T: 1099511627776 };
   if (!m) return { used: null, total: null };
   return { total: Number(m[1]) * (mult[(m[2] || 'B').toUpperCase()] || 1), used: Number(m[3]) * (mult[(m[4] || 'B').toUpperCase()] || 1) };
-}
-function toBytes(v, u) {
-  const mult = { '': 1, B: 1, K: 1024, M: 1048576, G: 1073741824, T: 1099511627776 };
-  return Number(v) * (mult[(u || '').toUpperCase()] || 1);
-}
-let topCache = null, topCacheAt = 0, topPrev = null;
-async function topSample() {
-  const now = Date.now();
-  if (topCache && (now - topCacheAt) < 2500) return topCache;
-  let s = '';
-  try {
-    ({ stdout: s } = await execFileAsync('top', ['-l', '1', '-n', '0'], { encoding: 'utf8', timeout: 3500, maxBuffer: 16 * 1024 * 1024 }));
-  } catch {}
-  const o = { at: now };
-  let m;
-  if ((m = s.match(/Processes:\s*(\d+)\s*total,\s*(\d+)\s*running,\s*(?:(\d+)\s*stuck,\s*)?(\d+)\s*sleeping,\s*(\d+)\s*threads/))) {
-    o.procTotal = Number(m[1]); o.procRunning = Number(m[2]); o.procSleeping = Number(m[4]); o.threads = Number(m[5]);
-  }
-  if ((m = s.match(/CPU usage:\s*([\d.]+)%\s*user,\s*([\d.]+)%\s*sys,\s*([\d.]+)%\s*idle/))) {
-    o.cpuUser = Number(m[1]); o.cpuSys = Number(m[2]); o.cpuIdle = Number(m[3]);
-  }
-  if ((m = s.match(/PhysMem:\s*([\d.]+)([KMG]?)\s*used\s*\(([\d.]+)([KMG]?)\s*wired,\s*([\d.]+)([KMG]?)\s*compressor\),\s*([\d.]+)([KMG]?)\s*unused/))) {
-    o.memUsed = toBytes(m[1], m[2]); o.memWired = toBytes(m[3], m[4]); o.memComp = toBytes(m[5], m[6]); o.memUnused = toBytes(m[7], m[8]);
-  }
-  if ((m = s.match(/([\d,]+)\(\d+\)\s*swapins,\s*([\d,]+)\(\d+\)\s*swapouts/))) {
-    o.swapins = Number(m[1].replace(/,/g, '')); o.swapouts = Number(m[2].replace(/,/g, ''));
-  }
-  if ((m = s.match(/Networks:\s*packets:\s*(\d+)\/([\d.]+)([KMG]?)\s*in,\s*(\d+)\/([\d.]+)([KMG]?)\s*out/))) {
-    o.netPktIn = Number(m[1]); o.netByteIn = toBytes(m[2], m[3]); o.netPktOut = Number(m[4]); o.netByteOut = toBytes(m[5], m[6]);
-  }
-  if ((m = s.match(/Disks:\s*(\d+)\/([\d.]+)([KMG]?)\s*read,\s*(\d+)\/([\d.]+)([KMG]?)\s*written/))) {
-    o.diskOpRead = Number(m[1]); o.diskByteRead = toBytes(m[2], m[3]); o.diskOpWrite = Number(m[4]); o.diskByteWrite = toBytes(m[5], m[6]);
-  }
-  if (topPrev && topPrev.at) {
-    const dt = (now - topPrev.at) / 1000;
-    if (dt > 0) {
-      const d = (a, b) => (a != null && b != null && a >= b) ? (a - b) / dt : 0;
-      o.netInRate = d(o.netByteIn, topPrev.netByteIn); o.netOutRate = d(o.netByteOut, topPrev.netByteOut);
-      o.netPktInRate = d(o.netPktIn, topPrev.netPktIn); o.netPktOutRate = d(o.netPktOut, topPrev.netPktOut);
-      o.diskReadRate = d(o.diskByteRead, topPrev.diskByteRead); o.diskWriteRate = d(o.diskByteWrite, topPrev.diskByteWrite);
-      o.diskOpReadRate = d(o.diskOpRead, topPrev.diskOpRead); o.diskOpWriteRate = d(o.diskOpWrite, topPrev.diskOpWrite);
-    }
-  }
-  topPrev = o;
-  topCache = o; topCacheAt = now;
-  return o;
 }
 function powerState(value) {
   const states = { charged: 'powerCharged', charging: 'powerCharging', discharging: 'powerDischarging', 'finishing charge': 'powerFinishing', 'ac attached': 'powerAc' };
@@ -364,9 +325,9 @@ async function probe(url, label, signal) {
 }
 let probeCache = null, probeCacheAt = 0, legacyProbeAbort = null;
 const PROBE_TTL_MS = 10000;
-async function getProbes() {
+async function getProbes(force = false) {
   if (options.noProbes) return [];
-  if (probeCache && Date.now() - probeCacheAt < PROBE_TTL_MS) return probeCache;
+  if (!force && probeCache && Date.now() >= probeCacheAt && Date.now() - probeCacheAt < PROBE_TTL_MS) return probeCache;
   legacyProbeAbort = new AbortController();
   const signal = legacyProbeAbort.signal;
   probeCache = await Promise.all([
@@ -406,6 +367,8 @@ function dbInventory() {
 // ===== 单次采集 + 渲染 =====
 async function runOnce() {
   NOW = Date.now();
+  refreshSources(forceNetworkRefresh);
+  if (forceNetworkRefresh) CONFIG_TEXT = null;
   const cols = process.stdout.columns || 110;
   const twoCol = cols >= 84;
   const leftW = twoCol ? dashboardLayout(cols).left : cols;
@@ -426,7 +389,7 @@ async function runOnce() {
 
   const sampleStarted = Date.now();
   const forceThisSample = forceNetworkRefresh;
-  const topPromise = topSample();
+  const topPromise = topSampler.sample({ force: forceThisSample, signal: shutdown.signal });
   const legacyProbeTask = legacyProbeController.refresh(null, { force: forceThisSample });
   const host = hostSampler.sample();
   const networkDetailsPromise = networkDetailsSampler.sample({ interfaceName: host.network.interfaceName, force: forceNetworkRefresh });
@@ -447,7 +410,8 @@ async function runOnce() {
   const netInRate = host.network.inRate, netOutRate = host.network.outRate;
   const netRate = Number.isFinite(netInRate) && Number.isFinite(netOutRate) ? (netInRate + netOutRate) / 1024 : -1;
   const dio = { rRate: host.disk.readRate, wRate: host.disk.writeRate, rOpRate: host.disk.readIOPS, wOpRate: host.disk.writeIOPS };
-  const curLogId = LG ? Number(one(LG.db, "SELECT max(id) m FROM logs")?.m || 0) : null;
+  const logHead = LG ? one(LG.db, "SELECT max(id) m FROM logs") : null;
+  const curLogId = Number.isFinite(logHead?.m) ? logHead.m : null;
   const logAt = Date.now();
   const logRate = curLogId != null && lastLogId != null && logAt > lastLogAt && curLogId >= lastLogId
     ? (curLogId - lastLogId) / ((logAt - lastLogAt) / 1000) : null;
@@ -816,8 +780,9 @@ const HELP = [
 if (options.help) { console.log(HELP); process.exit(0); }
 
 function closeDatabases() {
+  shutdown.abort();
   networkProbeController.close(); legacyProbeController.close();
-  for (const source of [TH, ST, LG, Q, G]) { try { source?.db.close(); } catch {} }
+  sourceRegistry.close();
 }
 
 if (watch) {
@@ -827,15 +792,16 @@ if (watch) {
   const wake = () => { if (wakeWatch) { const resolve = wakeWatch; wakeWatch = null; resolve(); } };
   const decodeKeys = createKeyDecoder();
   const onKey = chunk => {
-    if (String(chunk).includes('\x03')) { uiState.quit = true; wake(); return; }
+    if (String(chunk).includes('\x03')) { uiState.quit = true; shutdown.abort(); wake(); return; }
     const wasPaused = uiState.paused;
     for (const key of decodeKeys(chunk)) uiState = reduceKey(uiState, key, lastLeftViewportRows);
+    if (uiState.quit) shutdown.abort();
     if (wasPaused && !uiState.paused && hist.at.length) {
       for (const key of Object.keys(hist)) pushHist(key, key === 'at' ? Date.now() - 1 : null);
     }
     wake();
   };
-  const onSignal = () => { uiState.quit = true; wake(); };
+  const onSignal = () => { uiState.quit = true; shutdown.abort(); wake(); };
   if (terminal) process.stdout.write('\x1b[?1049h\x1b[?25l\x1b[?7l');
   if (interactive) { process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on('data', onKey); }
   process.stdout.on('resize', wake);

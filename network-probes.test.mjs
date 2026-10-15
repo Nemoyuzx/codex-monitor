@@ -96,6 +96,37 @@ test('PAC remains unresolved and does not cause an invented proxy request', asyn
   assert.doesNotMatch(JSON.stringify(result), /private/);
 });
 
+test('unknown or malformed PAC configuration stays unknown instead of disabled', async () => {
+  for (const systemProxy of [null, {}, { pac: {} }, { pac: { enabled: null } }, { pac: { enabled: '0' } }]) {
+    const result = await createNetworkProbeSampler({ env: {}, run: successfulRun })
+      .sample({ networkDetails: { systemProxy } });
+    assert.deepEqual(result.pac, { enabled: null, status: 'unknown' });
+    assert.equal(result.direct.status, 'ok');
+  }
+  const sampler = createNetworkProbeSampler({ env: {}, run: successfulRun });
+  const disabled = await sampler.sample({ networkDetails: { systemProxy: { pac: { enabled: false } } } });
+  assert.deepEqual(disabled.pac, { enabled: false, status: 'disabled' });
+  const unknown = await sampler.sample({ networkDetails: { systemProxy: null } });
+  assert.deepEqual(unknown.pac, { enabled: null, status: 'unknown' });
+  assert.notEqual(unknown, disabled);
+});
+
+test('each collection shares one sanitized environment snapshot across its requests', async () => {
+  const environments = [];
+  const environment = { PATH: process.env.PATH, SAFE_VALUE: 'before', HTTPS_PROXY: 'http://localhost:7890', SSLKEYLOGFILE: '/private/keylog' };
+  const sampler = createNetworkProbeSampler({ env: environment, run: async (...args) => {
+    environments.push(args[2].env);
+    environment.SAFE_VALUE = 'after';
+    return successfulRun(...args);
+  } });
+  await sampler.sample();
+  assert.equal(environments.length, 4);
+  assert.ok(environments.every(value => value === environments[0]));
+  assert.equal(environments[0].SAFE_VALUE, 'before');
+  assert.equal(environments[0].HTTPS_PROXY, undefined);
+  assert.equal(environments[0].SSLKEYLOGFILE, undefined);
+});
+
 test('HTTP refusals, redirects, HTML, invalid IP and private IP never validate an exit', async () => {
   for (const [body, httpStatus] of [['{"ip":"8.8.8.8"}', '403'], ['{"ip":"8.8.8.8"}', '302'], ['<html>OK</html>', '200'],
     ['{"error":"blocked"}', '200'], ['{"ip":"bad-ip"}', '200'], ['{"ip":"127.0.0.1"}', '200'],

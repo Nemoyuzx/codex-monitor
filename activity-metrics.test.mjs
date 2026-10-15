@@ -300,3 +300,109 @@ test('interrupted and cancelled tools with completion timestamps are not success
   assert.equal(r.tools.pending, 0);
   assert.equal(r.tools.durationSampleCount, 0);
 });
+
+test('one sample prepares repeated SQL once per shared connection and the next sample prepares afresh', t => {
+  const { db, thread, item, options } = fixture(t);
+  for (let i = 0; i < 24; i++) { thread('prepared-' + i); item('prepared-' + i, 1); }
+  const prepares = new Map();
+  const reader = {
+    prepare(sql) {
+      prepares.set(sql, (prepares.get(sql) || 0) + 1);
+      return db.prepare(sql);
+    },
+  };
+  const sharedOptions = Object.fromEntries(['historyDb', 'stateDb', 'logsDb', 'queueDb', 'goalsDb'].map(key => [key, reader]));
+  const first = collectActivity({ ...options, ...sharedOptions });
+  assert.equal(first.tools.window10m.total, 24);
+  assert.equal(prepares.get('PRAGMA schema_version'), 1);
+  assert.ok([...prepares.values()].every(count => count === 1));
+  const itemSql = [...prepares.keys()].find(sql => sql.includes('SELECT bounded.item_id'));
+  assert.equal(prepares.get(itemSql), 1);
+  prepares.clear();
+  item('prepared-0', 2);
+  const second = collectActivity({ ...options, ...sharedOptions, now: NOW + 5000 });
+  assert.equal(second.tools.window10m.total, 25);
+  assert.equal(prepares.get(itemSql), 1, 'statement cache is scoped to this sample');
+  assert.equal(prepares.get('PRAGMA schema_version'), 1);
+  assert.ok([...prepares.values()].every(count => count === 1));
+});
+
+test('schema changes reveal newly created tables and added columns on the same connection', t => {
+  const db = new DatabaseSync(':memory:'); t.after(() => db.close());
+  const first = collectActivity({ logsDb: db, stateDb: db, now: NOW });
+  assert.equal(first.availability.logs, false);
+  db.exec(`CREATE TABLE logs(ts INTEGER,level TEXT,target TEXT);
+    INSERT INTO logs VALUES(${NOW / 1000},'WARN','synthetic-target');
+    CREATE TABLE threads(id TEXT PRIMARY KEY);
+    INSERT INTO threads VALUES('synthetic-thread');`);
+  const second = collectActivity({ logsDb: db, stateDb: db, now: NOW + 5000 });
+  assert.equal(second.availability.logs, true);
+  assert.equal(second.alerts.warn10m, 1);
+  assert.equal(second.tokens.total, null);
+  assert.equal(second.sessions.recentHour, 0);
+  db.exec(`ALTER TABLE threads ADD COLUMN tokens_used INTEGER;
+    ALTER TABLE threads ADD COLUMN updated_at_ms INTEGER;
+    UPDATE threads SET tokens_used=123,updated_at_ms=${NOW};`);
+  const third = collectActivity({ logsDb: db, stateDb: db, now: NOW + 10000 });
+  assert.equal(third.tokens.total, 123);
+  assert.equal(third.sessions.recentHour, 1);
+  assert.equal(third.sessions.rows[0].id, 'synthetic-thread');
+});
+
+test('a transient schema-version failure invalidates all affected projections and recovers next sample', t => {
+  const { db, options } = fixture(t);
+  let busy = true;
+  const reader = failedQueryReader(db, sql => busy && sql === 'PRAGMA schema_version');
+  const sharedOptions = Object.fromEntries(['historyDb', 'stateDb', 'logsDb', 'queueDb', 'goalsDb'].map(key => [key, reader]));
+  const first = collectActivity({ ...options, ...sharedOptions });
+  assert.ok(Object.values(first.availability).every(available => available === false));
+  assert.deepEqual(new Set(first.coverage.failedSources), new Set(['history', 'state', 'logs', 'queue', 'goals']));
+  assert.equal(first.tokens.total, null);
+  assert.equal(first.alerts.error10m, null);
+  assert.equal(first.tools.pending, null);
+  assert.equal(first.queue.count, null);
+  assert.equal(first.goals.active, null);
+  busy = false;
+  const second = collectActivity({ ...options, ...sharedOptions, now: NOW + 5000 });
+  assert.ok(Object.values(second.availability).every(available => available === true));
+  assert.deepEqual(second.coverage.failedSources, []);
+  assert.equal(second.alerts.error10m, 0);
+  assert.equal(second.queue.count, 0);
+});
+
+test('indexed recent-turn ranges preserve mixed-unit, fractional, future and cutoff membership', t => {
+  const { db, item } = fixture(t);
+  const now = NOW + 123, cutoff = now - HOUR;
+  const starts = [
+    null, -1, 0,
+    Math.floor(cutoff / 1000), cutoff / 1000 - 0.0001, cutoff / 1000, cutoff / 1000 + 0.0001,
+    cutoff - 1, cutoff, cutoff + 1,
+    99_999_999_999, 100_000_000_000, 100_000_000_001,
+    (now + HOUR) / 1000, now + HOUR,
+  ];
+  const turn = db.prepare('INSERT INTO thread_turns VALUES(?,?,?,?)');
+  for (const [index, startedAt] of starts.entries()) {
+    const id = 'boundary-' + index;
+    turn.run(id, 'turn', 'completed', startedAt);
+    item(id, 1);
+  }
+  db.exec('CREATE INDEX turns_started_at ON thread_turns(started_at)');
+  const expected = db.prepare(`SELECT thread_id FROM thread_turns
+    WHERE (CASE WHEN started_at<100000000000 THEN started_at*1000 ELSE started_at END)>=?`).all(cutoff).map(row => row.thread_id).sort();
+  let recentQuery;
+  const reader = {
+    prepare(sql) {
+      const statement = db.prepare(sql);
+      return { all(...args) {
+        if (sql.includes('MAX(started_at) AS last_start')) recentQuery = { sql, args };
+        return statement.all(...args);
+      } };
+    },
+  };
+  const result = collectActivity({ historyDb: reader, now, threads: 32 });
+  assert.deepEqual(result.sessions.rows.map(row => row.id).sort(), expected);
+  assert.ok(expected.includes('boundary-13'), 'future-second candidates retain existing semantics');
+  assert.ok(expected.includes('boundary-14'), 'future-millisecond candidates retain existing semantics');
+  const plan = db.prepare('EXPLAIN QUERY PLAN ' + recentQuery.sql).all(...recentQuery.args);
+  assert.ok(plan.some(row => row.detail.includes('SEARCH') && row.detail.includes('turns_started_at')));
+});

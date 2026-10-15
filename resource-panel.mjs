@@ -4,32 +4,83 @@ import catalog from './locales/resource.mjs';
 
 const t = createTranslator(catalog);
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g;
+const TERMINAL_TOKEN = /\x1b\[[0-9;?]*[A-Za-z]|[\s\S]/gu;
+const SIMPLE_TEXT = /^[\x20-\x7e\u00a0-\u02ff\u2000-\u200a\u2010-\u2027\u2030-\u205e\u2100-\u22ff\u2500-\u9fff\uac00-\ud7a3\uff00-\uffef]*$/u;
+const MARK = /\p{Mark}/u;
+const EMOJI = /\p{Emoji_Presentation}|\p{Regional_Indicator}{2}|\u20e3|\p{Extended_Pictographic}\ufe0f/u;
+const graphemes = new Intl.Segmenter('und', { granularity: 'grapheme' });
 const BRAILLE = [[1, 2, 4, 64], [8, 16, 32, 128]];
 
-export function charW(ch) {
+function codePointWidth(ch) {
   const c = ch.codePointAt(0);
-  if (/\p{Mark}/u.test(ch) || c === 0x200d || c === 0xfe0f) return 0;
+  if (c < 0x300) return c < 0x20 || (c >= 0x7f && c <= 0x9f) ? 0 : 1;
+  if (c >= 0x2800 && c <= 0x28ff) return 1;
+  if (MARK.test(ch) || (c >= 0x200b && c <= 0x200f) || c === 0xfeff) return 0;
   if ((c >= 0x1100 && c <= 0x115f) || (c >= 0x2e80 && c <= 0xa4cf) ||
       (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xf900 && c <= 0xfaff) ||
       (c >= 0xfe10 && c <= 0xfe6f) || (c >= 0xff01 && c <= 0xff60) ||
       (c >= 0xffe0 && c <= 0xffe6) || (c >= 0x1f300 && c <= 0x1faff) || c >= 0x20000) return 2;
+  if (c >= 0x2300 && EMOJI.test(ch)) return 2;
   return 1;
 }
 
+// ASCII, CJK, box drawing and braille dominate ordinary frames. Only strings
+// with possible multi-code-point clusters need the grapheme segmenter.
+export function terminalTokens(text) {
+  const source = String(text);
+  const plain = source.includes('\x1b') ? source.replace(ANSI, '') : source;
+  if (SIMPLE_TEXT.test(plain) && !MARK.test(plain)) return source.match(TERMINAL_TOKEN) || [];
+  if (plain === source) return Array.from(graphemes.segment(plain), item => item.segment);
+  const tokens = source.match(TERMINAL_TOKEN) || [];
+  const result = [];
+  let index = 0;
+  for (const { segment } of graphemes.segment(plain)) {
+    let raw = '', remaining = segment.length;
+    while (remaining > 0 && index < tokens.length) {
+      const token = tokens[index++];
+      raw += token;
+      if (!token.startsWith('\x1b')) remaining -= token.length;
+    }
+    result.push(raw);
+  }
+  return result.concat(tokens.slice(index));
+}
+
+export function charW(ch) {
+  const plain = ch.length > 2 && ch.includes('\x1b') ? ch.replace(ANSI, '') : ch;
+  if (!plain) return 0;
+  const first = plain.codePointAt(0);
+  if (plain.length === (first > 0xffff ? 2 : 1)) {
+    return codePointWidth(plain);
+  }
+  // Emoji modifiers, flags, keycaps and ZWJ sequences occupy one terminal cell
+  // pair. Taking the widest component also keeps combining text and Hangul
+  // clusters intact without adding the width of their combining components.
+  if (EMOJI.test(plain)) return 2;
+  let width = 0;
+  for (const component of plain) width = Math.max(width, codePointWidth(component));
+  return width;
+}
+
 export function visLen(s) {
-  return Array.from(String(s).replace(ANSI, '')).reduce((n, ch) => n + charW(ch), 0);
+  const plain = String(s).replace(ANSI, '');
+  if (/^[\x20-\x7e]*$/.test(plain)) return plain.length;
+  if (SIMPLE_TEXT.test(plain) && !MARK.test(plain)) {
+    let width = 0;
+    for (const ch of plain) width += codePointWidth(ch);
+    return width;
+  }
+  return terminalTokens(plain).reduce((n, ch) => n + charW(ch), 0);
 }
 
 export function truncVis(s, width) {
   let out = '', used = 0;
   const colored = String(s).includes('\x1b');
-  for (const seg of String(s).split(/(\x1b\[[0-9;?]*[A-Za-z])/g)) {
-    if (seg.startsWith('\x1b')) { out += seg; continue; }
-    for (const ch of seg) {
-      if (used + charW(ch) > width) return out + (colored ? '\x1b[0m' : '');
-      out += ch;
-      used += charW(ch);
-    }
+  for (const token of terminalTokens(s)) {
+    const size = charW(token);
+    if (used + size > width) return out + (colored ? '\x1b[0m' : '');
+    out += token;
+    used += size;
   }
   return out;
 }

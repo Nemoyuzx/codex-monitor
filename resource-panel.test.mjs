@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { columnWidths, fitRows, historyGraph, historyStats, renderResourcePanel, visLen } from './resource-panel.mjs';
+import { columnWidths, fitRows, historyGraph, historyStats, renderResourcePanel, truncVis, visLen } from './resource-panel.mjs';
 
 const now = 100_000;
 const times = Array.from({ length: 80 }, (_, i) => now - (79 - i) * 1000);
@@ -21,6 +21,33 @@ const model = {
     ] },
   ],
 };
+
+test('terminal widths and truncation keep complete emoji and combining graphemes', () => {
+  for (const cluster of ['👩‍💻', '👨‍👩‍👧‍👦', '👋🏽', '🇨🇳', '1️⃣', '☑️', '⌚', '✅', '◽']) {
+    assert.equal(visLen(cluster), 2, cluster);
+    assert.equal(truncVis(cluster + 'X', 1), '', cluster);
+    assert.equal(truncVis(cluster + 'X', 2), cluster, cluster);
+    assert.equal(truncVis(cluster + 'X', 3), cluster + 'X', cluster);
+  }
+  for (const cluster of ['e\u0301', 'か\u3099', '가']) {
+    const width = cluster.startsWith('e') ? 1 : 2;
+    assert.equal(visLen(cluster), width);
+    assert.equal(truncVis(cluster + 'X', width), cluster);
+    assert.equal(truncVis(cluster, width - 1), '');
+  }
+  assert.equal(visLen('a\u200bb'), 2, 'zero-width spaces do not consume columns');
+  assert.equal(visLen('☑︎'), 1, 'text-presentation selectors do not force emoji width');
+});
+
+test('ANSI color changes inside a grapheme do not split its visible characters', () => {
+  const colored = '\x1b[35m👩\x1b[36m‍💻\x1b[0mX';
+  const strip = value => value.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+  assert.equal(visLen(colored), 3);
+  assert.equal(strip(truncVis(colored, 2)), '👩‍💻');
+  assert.equal(strip(truncVis(colored, 1)), '');
+  const accent = '\x1b[35me\x1b[36m\u0301\x1b[0mX';
+  assert.equal(strip(truncVis(accent, 1)), 'e\u0301');
+});
 
 test('responsive panels fit terminal width and height with ANSI and Chinese text', () => {
   for (const cols of [84, 110, 180, 240, 360]) {
