@@ -1,0 +1,23 @@
+{
+  "name": "codex-monitor",
+  "version": "0.1.0",
+  "description": "Read-only local Codex terminal dashboard for macOS with live resource charts and real proxy egress checks",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "author": "Nemoyuzx",
+  "engines": { "node": ">=24" },
+  "bin": { "codex-monitor": "bin/codex-monitor.mjs" },
+  "scripts": {
+    "start": "node bin/codex-monitor.mjs",
+    "monitor": "node codex-status.mjs --watch",
+    "test": "node --test *.test.mjs",
+    "check": "node scripts/check-syntax.mjs",
+    "demo": "node scripts/demo.mjs"
+  },
+  "files": ["bin/", "scripts/", "*.mjs", "README.md", "CONTRIBUTING.md", "LICENSE"],
+  "repository": { "type": "git", "url": "https://github.com/Nemoyuzx/codex-monitor.git" },
+  "bugs": { "url": "https://github.com/Nemoyuzx/codex-monitor/issues" },
+  "homepage": "https://github.com/Nemoyuzx/codex-monitor#readme",
+  "keywords": ["codex", "monitor", "tui", "macos", "terminal", "proxy", "read-only"]
+}
