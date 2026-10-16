@@ -1,12 +1,12 @@
 # codex-monitor
 
-[简体中文](README.md) · [English](README.en.md)
+[简体中文](README.md) · [繁體中文](README.zh-TW.md) · [English](README.en.md) · [日本語](README.ja.md)
 
 A read-only local Codex terminal dashboard for macOS, with live host resource charts, chat and tool activity, process details, network configuration, and real HTTPS proxy egress checks. No third-party npm runtime dependencies. This is an independent community project, with no official affiliation with OpenAI.
 
-![Interface preview using synthetic data](docs/preview.svg)
+![Redacted interface preview using synthetic data](docs/preview-en.svg)
 
-The preview uses **synthetic DEMO data** for chats, IP addresses, and resource charts. Rebuild it with `npm run demo`. It is neither a real account screenshot nor a performance measurement.
+The preview uses **synthetic DEMO data**. Chat names, models, paths, IPs, gateways, DNS, proxy endpoints, and messages are replaced with opaque masks before rendering; original values are absent from the SVG source. Charts, proxy status, and durations are not real measurements or account data. Run `npm run demo` to rebuild all four redacted language previews, or `npm run demo -- --lang en` for English only.
 
 ## Install and start
 

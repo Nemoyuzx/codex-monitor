@@ -1,6 +1,6 @@
 # codex-monitor
 
-[简体中文](README.md) · [English](README.en.md)
+[简体中文](README.md) · [繁體中文](README.zh-TW.md) · [English](README.en.md) · [日本語](README.ja.md)
 
 只读的本地 Codex 终端监控台：主机资源、聊天与工具活动、进程、网络及真实代理出口检测。独立社区项目，与 OpenAI 无官方隶属关系。
 
@@ -8,7 +8,7 @@ Read-only local Codex terminal dashboard for macOS. Live resource charts, activi
 
 ![使用模拟数据的界面预览](docs/preview.svg)
 
-预览中的会话、IP 和资源曲线均为模拟数据，可用 `npm run demo` 重建；不是实际性能测量或真实账号截图。
+预览使用合成 DEMO 数据。会话名、模型、路径、IP、网关、DNS、代理地址与消息在渲染前已替换为不透明遮挡，SVG 源码不保留原值；曲线、代理状态和耗时不是实际测量或真实账号信息。运行 `npm run demo` 可重建四种语言的脱敏预览，或用 `npm run demo -- --lang en` 只生成英文版。
 
 ## 安装与启动
 

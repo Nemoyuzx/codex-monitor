@@ -6,6 +6,7 @@ import { optionsCatalog } from './locales/options.mjs';
 import { dashboardCatalog } from './locales/dashboard.mjs';
 import resourceCatalog from './locales/resource.mjs';
 import { statusMessages } from './locales/status.mjs';
+import { demoCatalog } from './locales/demo.mjs';
 
 test('POSIX locale tags normalize script/region aliases without accepting unrelated languages', () => {
   for (const [input, expected] of Object.entries({ 'en_US.UTF-8':'en', 'en-GB':'en', 'ja_JP.UTF-8':'ja',
@@ -58,7 +59,7 @@ test('locale-specific relative time handles unavailable and future timestamps sa
 });
 
 test('every shipped catalog has all four complete translations with the same interpolation fields', () => {
-  const catalogs={optionsCatalog,dashboardCatalog,resourceCatalog,statusMessages};
+  const catalogs={optionsCatalog,dashboardCatalog,resourceCatalog,statusMessages,demoCatalog};
   const fields=s=>[...String(s).matchAll(/\{([A-Za-z0-9_]+)\}/g)].map(m=>m[1]).sort();
   for(const [name,catalog] of Object.entries(catalogs)){
     assert.ok(Object.keys(catalog).length>0,name);

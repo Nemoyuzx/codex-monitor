@@ -2,7 +2,7 @@
 
 目前主要维护 macOS。欢迎提交问题、兼容性修复和聚焦的小改动。
 
-User documentation: [简体中文](README.md) · [English](README.en.md). The project primarily targets macOS; focused fixes and compatibility reports are welcome.
+User documentation: [简体中文](README.md) · [繁體中文](README.zh-TW.md) · [English](README.en.md) · [日本語](README.ja.md). The project primarily targets macOS; focused fixes and compatibility reports are welcome.
 
 ## 开发验证
 
@@ -44,6 +44,10 @@ To add a language:
 1. Add its canonical tag to `SUPPORTED_LOCALES` and its display name to `LOCALE_NAMES` in `i18n.mjs`. Extend `normalizeLocale` with the intended system-tag aliases; preserve documented automatic-detection precedence and the English fallback.
 2. Add a translation for every message in all four catalogs. Do not rely on fallback text to make a partial language appear complete.
 3. Extend the locale and option tests, then check help, argument errors, all four pages, and both narrow and wide terminal layouts. Preserve ANSI handling and display-cell width, including CJK characters.
-4. Update the language lists and CLI examples in both READMEs. JSON field names and raw values must remain compatible across languages.
+4. Update the language lists and CLI examples in all translated READMEs. JSON field names and raw values must remain compatible across languages.
 
-界面翻译只作用于内置文字，不能改写用户内容或采集结果。新增语言时需要补全全部词条、占位符、系统语言识别、参数测试和窄屏布局验证，再更新中英文文档。
+界面翻译只作用于内置文字，不能改写用户内容或采集结果。新增语言时需要补全全部词条、占位符、系统语言识别、参数测试和窄屏布局验证，再更新各语言文档。
+
+## Public previews / 公开预览
+
+`npm run demo` rebuilds four localized SVG previews from deterministic synthetic data only. Preview-only text lives in `locales/demo.mjs`; it does not translate or alter runtime collector data. Chat names, models, paths, messages, and network addresses are replaced before layout and text-node generation. Never place an opaque rectangle over raw SVG text while retaining the original value underneath. Run `node --test demo.test.mjs` to check language, determinism, and redaction in the text layer and metadata.

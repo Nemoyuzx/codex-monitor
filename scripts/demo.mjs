@@ -2,9 +2,15 @@
 // Public preview only: deterministic synthetic data, with no samplers, commands,
 // network requests, environment inspection, or access to local Codex databases.
 import { mkdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createTranslator, normalizeLocale, SUPPORTED_LOCALES, withLocale } from '../i18n.mjs';
+import { demoCatalog } from '../locales/demo.mjs';
+import { statusMessages } from '../locales/status.mjs';
+import { dashboardCatalog } from '../locales/dashboard.mjs';
 import { buildDashboardRegions } from '../dashboard-model.mjs';
 import { dashboardLayout, renderInformationSections, composeInformationPane } from '../dashboard-layout.mjs';
-import { charW, fitRows, padVis, renderResourcePanel, truncVis, visLen } from '../resource-panel.mjs';
+import { charW, fitRows, padVis, renderResourcePanel, truncVis, visLen, terminalTokens } from '../resource-panel.mjs';
 
 const cols = 251, rows = 72;
 const now = Date.parse('2026-01-01T04:00:00Z');
@@ -74,97 +80,146 @@ const data = {
   } },
 };
 
-const paint = (code, text) => `\x1b[${code}m${text}\x1b[0m`;
-const layout = dashboardLayout(cols);
-const { charts, information, systemStatus } = buildDashboardRegions({ ...data, width: layout.right }, { detailWidth: layout.secondary });
-const section = tag => information.find(item => item.tag === tag);
-const network = structuredClone(section('NETWORK'));
-network.title = 'IP · 路由 · 代理（模拟）';
-network.rows = network.rows.map(row => row.label === '公网与代理实测'
-  ? { ...row, value: 'DEMO · 以下均为模拟结果', tone: 'yellow' } : row);
-const header = [
-  paint('1;36', 'Codex 本地状态') + '  ' + paint('1;33', 'DEMO · 模拟数据'),
-  paint('2', '全合成预览 · 无真实会话、设备或公网信息'),
-  '模型 ' + paint('36', 'example-model') + paint('2', ' · 只读监控 · 1s 刷新 · 80s 趋势窗口'),
-  paint('2', '─'.repeat(layout.left)),
-  '状态  ' + paint('32', '演示运行中') + paint('2', ' · 1 个示例任务 · 工具执行中 0 · 队列 0'),
-  '',
-];
-const primary = renderInformationSections([
-  { title: '主机状态（模拟）', tone: 'magenta', rows: [
-    { label: '主机', value: 'Demo Mac · 12 核 · 24 GB' },
-    { label: 'CPU', value: '全机 30% · Codex 多核 56%' },
-    { label: '内存', value: '物理已用 15 GB / 24 GB' },
-    { label: '网络接口', value: 'en0 · 192.0.2.20' },
-    { label: '采样', value: '合成趋势 · 80 个样本' },
-  ] },
-  { title: '最近可见事件（模拟）', tone: 'cyan', rows: [
-    { label: '会话', value: '示例会话 A' },
-    { label: '类型', value: 'tool completed' },
-    { label: '内容', value: '演示工具已完成，无真实命令或消息' },
-    { label: '距现在', value: '2 秒前' },
-    '',
-    paint('36', '  2 秒前  工具完成    示例会话 A'),
-    paint('36', '  8 秒前  任务活动    示例会话 B'),
-    paint('36', ' 18 秒前  任务更新    示例会话 A'),
-  ] },
-  section('TASKS'), section('TOOLS'), section('PROCESSES'),
-], { width: layout.primary, color: true });
-const secondary = renderInformationSections([
-  network, section('CODEX'), section('HEALTH'), section('METRICS'),
-  { title: '预览说明', tone: 'yellow', rows: [
-    '所有数值均为合成示例；不代表真实设备性能。',
-    '公网 IP / 代理成功状态 / 延迟均未真实探测。',
-    'IP 使用文档保留地址；原生 tok/s 无数据留空。',
-  ] },
-].filter(Boolean), { width: layout.secondary, color: true });
-const left = composeInformationPane({ header, primary, secondary }, { layout, height: rows - 2, color: true, scroll: true }).rows;
-const status = fitRows(renderInformationSections([systemStatus], { width: layout.right, color: true }), Math.floor((rows - 2) / 4));
-const right = renderResourcePanel(charts, { width: layout.right, height: rows - 3 - status.length, color: true, presentation: 'charts' }).concat('', status);
-const terminal = Array.from({ length: rows - 2 }, (_, i) => padVis(truncVis(left[i] || '', layout.left), layout.left)
-  + paint('2', ' │ ') + (right[i] || ''));
-terminal.push(paint('2', ' [1 总览]   2 主机   3 任务   4 诊断   ·   Space 暂停   ↑↓ 滚动   [ ] 时间窗口   r 刷新   h 帮助   q 退出'));
-terminal.push(paint('1;33', ' DEMO · 模拟数据：本图仅展示界面，不包含真实日志、IP、会话或性能测量。'));
-if (terminal.some(line => visLen(line) > cols) || terminal.length > rows) throw new Error('Demo exceeds its terminal bounds');
+const MASK = '████████';
 
-const palette = { default: '#e7e8ec', 30: '#202126', 31: '#f26868', 32: '#65cf62', 33: '#dcc363',
-  34: '#779de8', 35: '#d97bdd', 36: '#5bc9d2', 37: '#e7e8ec', 90: '#8c909a' };
-const escape = text => text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
-const cellWidth = 8, cellHeight = 16, inset = 24, chrome = 50;
-const width = cols * cellWidth + inset * 2, height = rows * cellHeight + chrome + inset * 2;
-const textNodes = [];
-for (const [lineIndex, line] of terminal.entries()) {
-  let column = 0, color = palette.default, bold = false, dim = false;
-  for (const token of line.match(/\x1b\[[0-9;?]*[A-Za-z]|[\s\S]/gu) || []) {
-    if (token.startsWith('\x1b')) {
-      const codes = token.slice(2, -1).split(';').map(Number);
-      for (const code of codes) {
-        if (code === 0) { color = palette.default; bold = false; dim = false; }
-        else if (code === 1) bold = true;
-        else if (code === 2) dim = true;
-        else if (palette[code]) color = palette[code];
-      }
-      continue;
-    }
-    const cells = charW(token);
-    if (token !== ' ' && cells) textNodes.push(`<text x="${inset + column * cellWidth}" y="${chrome + inset + lineIndex * cellHeight}" fill="${color}"${bold ? ' font-weight="700"' : ''}${dim ? ' opacity="0.53"' : ''} textLength="${cells * cellWidth}" lengthAdjust="spacingAndGlyphs">${escape(token)}</text>`);
-    column += cells;
+function redactedData() {
+  // Redact before layout, wrapping or SVG text generation: there is no original
+  // text underneath the bars and no private value in attributes or metadata.
+  const sample = structuredClone(data);
+  for (const chat of sample.activity.sessions.rows) { chat.label = MASK; chat.model = MASK; }
+  const network = sample.networkDetails;
+  network.addresses = { ipv4: [MASK], ipv6: [MASK] };
+  network.routes.ipv4.gateway = MASK; network.routes.ipv6.gateway = MASK;
+  network.dns.nameservers = [MASK];
+  for (const kind of ['http', 'https', 'socks']) if (network.systemProxy[kind]?.endpoint) network.systemProxy[kind].endpoint = MASK;
+  for (const route of [sample.networkProbes.result.direct, ...sample.networkProbes.result.proxies]) {
+    route.publicIp = MASK;
+    if (route.endpoint) route.endpoint = MASK;
+    for (const request of [route.ipLookup, route.connectivity]) if (request) delete request.target;
   }
+  return sample;
 }
-const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-labelledby="title description">
-<title id="title">Codex Monitor — DEMO · 模拟数据</title>
-<desc id="description">${cols}×${rows} 终端界面预览，左侧双栏，右侧八个趋势图与逐核系统状态。全部内容为合成演示；公网 IP、代理成功状态和延迟并非实测，IP 使用文档保留地址，不包含真实会话、设备或性能数据。</desc>
+
+export const PREVIEW_FILES = Object.freeze({ 'zh-CN': 'preview.svg', 'zh-TW': 'preview-zh-TW.svg', en: 'preview-en.svg', ja: 'preview-ja.svg' });
+const demoText = createTranslator(demoCatalog), statusText = createTranslator(statusMessages), dashboardText = createTranslator(dashboardCatalog);
+
+export function renderDemo({ locale = 'zh-CN' } = {}) {
+  const language = normalizeLocale(locale);
+  if (!language) throw new Error('Unsupported preview language: ' + locale);
+  return withLocale(language, () => renderLocalizedDemo(language));
+}
+
+function renderLocalizedDemo(locale) {
+  const t = demoText, paint = (code, text) => `\x1b[${code}m${text}\x1b[0m`;
+  const layout = dashboardLayout(cols);
+  const { charts, information, systemStatus } = buildDashboardRegions({ ...redactedData(), locale, width: layout.right }, { detailWidth: layout.secondary });
+  const section = tag => information.find(item => item.tag === tag);
+  const network = structuredClone(section('NETWORK'));
+  network.title = t('networkTitle');
+  network.rows = network.rows.map(row => row.label === dashboardText('公网与代理实测')
+    ? { ...row, value: t('probeMock'), tone: 'yellow' } : row);
+  const header = [
+    paint('1;36', statusText('title')) + '  ' + paint('1;33', t('badge')),
+    paint('2', t('source') + '  ' + MASK),
+    t('model') + ' ' + paint('36', MASK) + paint('2', ' · ' + t('summary')),
+    paint('2', '─'.repeat(layout.left)), t('status'), '',
+  ];
+  const primary = renderInformationSections([
+    { title: t('host'), tone: 'magenta', rows: [
+      { label: t('hostName'), value: MASK + ' · ' + t('device') },
+      { label: 'CPU', value: t('cpuValue') },
+      { label: t('memory'), value: t('memoryValue') },
+      { label: t('interface'), value: 'en0 · ' + MASK },
+      { label: t('sampling'), value: t('samplingValue') },
+    ] },
+    { title: t('eventTitle'), tone: 'cyan', rows: [
+      { label: t('chat'), value: MASK },
+      { label: t('type'), value: t('done') },
+      { label: t('content'), value: MASK },
+      { label: t('age'), value: t('ageValue') }, '',
+      paint('36', t('eventDone', { mask: MASK })),
+      paint('36', t('eventActive', { mask: MASK })),
+      paint('36', t('eventUpdate', { mask: MASK })),
+    ] },
+    section('TASKS'), section('TOOLS'), section('PROCESSES'),
+  ], { width: layout.primary, color: true });
+  const secondary = renderInformationSections([
+    network, section('CODEX'), section('HEALTH'), section('METRICS'),
+    { title: t('noteTitle'), tone: 'yellow', rows: [t('note1'), t('note2'), t('note3')] },
+  ].filter(Boolean), { width: layout.secondary, color: true });
+  const left = composeInformationPane({ header, primary, secondary }, { layout, height: rows - 2, color: true, scroll: true }).rows;
+  const status = fitRows(renderInformationSections([systemStatus], { width: layout.right, color: true }), Math.floor((rows - 2) / 4));
+  const right = renderResourcePanel(charts, { width: layout.right, height: rows - 3 - status.length, color: true, presentation: 'charts' }).concat('', status);
+  const terminal = Array.from({ length: rows - 2 }, (_, i) => padVis(truncVis(left[i] || '', layout.left), layout.left)
+    + paint('2', ' │ ') + (right[i] || ''));
+  terminal.push(paint('2', t('keyboard')), paint('1;33', t('footer')));
+  if (terminal.some(line => visLen(line) > cols) || terminal.length > rows) throw new Error('Demo exceeds its terminal bounds');
+
+  const palette = { default: '#e7e8ec', 30: '#202126', 31: '#f26868', 32: '#65cf62', 33: '#dcc363',
+    34: '#779de8', 35: '#d97bdd', 36: '#5bc9d2', 37: '#e7e8ec', 90: '#8c909a' };
+  const escape = text => text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+  const cellWidth = 8, cellHeight = 16, inset = 24, chrome = 50;
+  const width = cols * cellWidth + inset * 2, height = rows * cellHeight + chrome + inset * 2;
+  const textNodes = [];
+  const ansi = /\x1b\[[0-9;?]*[A-Za-z]/g;
+  for (const [lineIndex, line] of terminal.entries()) {
+    let column = 0, color = palette.default, bold = false, dim = false;
+    for (const token of terminalTokens(line)) {
+      for (const match of token.matchAll(/\x1b\[([0-9;?]*)m/g)) {
+        for (const code of match[1].split(';').map(Number)) {
+          if (code === 0) { color = palette.default; bold = false; dim = false; }
+          else if (code === 1) bold = true;
+          else if (code === 2) dim = true;
+          else if (palette[code]) color = palette[code];
+        }
+      }
+      const text = token.replace(ansi, ''), cells = charW(text);
+      if (text === '█') {
+        textNodes.push(`<rect x="${inset + column * cellWidth}" y="${chrome + inset + lineIndex * cellHeight - 12}" width="${cells * cellWidth}" height="14" fill="#626975" data-redacted="true"/>`);
+      } else if (text !== ' ' && cells) {
+        textNodes.push(`<text x="${inset + column * cellWidth}" y="${chrome + inset + lineIndex * cellHeight}" fill="${color}"${bold ? ' font-weight="700"' : ''}${dim ? ' opacity="0.53"' : ''} textLength="${cells * cellWidth}" lengthAdjust="spacingAndGlyphs">${escape(text)}</text>`);
+      }
+      column += cells;
+    }
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-labelledby="title description" lang="${locale}">
+<title id="title">${escape(t('svgTitle'))}</title>
+<desc id="description">${escape(t('svgDescription'))}</desc>
 <rect width="${width}" height="${height}" rx="18" fill="#1c1d21"/>
 <path d="M18 0H${width - 18}Q${width} 0 ${width} 18V48H0V18Q0 0 18 0" fill="#292c33"/>
 <g fill="#ff5f57"><circle cx="25" cy="24" r="6"/></g><circle cx="45" cy="24" r="6" fill="#febc2e"/><circle cx="65" cy="24" r="6" fill="#28c840"/>
 <text x="88" y="30" fill="#bcc2cf" font-family="monospace" font-size="15">codex-monitor · 251×72</text>
-<text x="${width - 24}" y="30" text-anchor="end" fill="#dcc363" font-family="monospace" font-size="15" font-weight="700">DEMO · 模拟数据 · synthetic data</text>
+<text x="${width - 24}" y="30" text-anchor="end" fill="#dcc363" font-family="monospace" font-size="15" font-weight="700">${escape(t('badge'))}</text>
 <g font-family="Menlo,Consolas,DejaVu Sans Mono,PingFang SC,Noto Sans Mono CJK SC,monospace" font-size="13" xml:space="preserve">
 ${textNodes.join('\n')}
 </g>
 </svg>
 `;
-const destination = new URL('../docs/preview.svg', import.meta.url);
-await mkdir(new URL('../docs/', import.meta.url), { recursive: true });
-await writeFile(destination, svg);
-console.log(`Generated docs/preview.svg — ${width}×${height}px, ${cols}×${rows} terminal cells; synthetic data only.`);
+}
+
+async function main(args) {
+  let selected = 'all', destination = new URL('../docs/', import.meta.url);
+  for (let i = 0; i < args.length; i++) {
+    const [flag, inline] = args[i].split(/=(.*)/s);
+    if (flag === '--help') { console.log('Usage: npm run demo -- [--lang all|zh-CN|zh-TW|en|ja] [--output-dir PATH]'); return; }
+    if (!['--lang', '--output-dir'].includes(flag)) throw new Error('Unknown preview option: ' + flag);
+    const value = inline ?? args[++i];
+    if (!value || value.startsWith('--')) throw new Error(flag + ' requires a value');
+    if (flag === '--lang') selected = value;
+    else destination = value;
+  }
+  const locales = selected === 'all' ? SUPPORTED_LOCALES : [normalizeLocale(selected)];
+  if (locales.some(locale => !locale)) throw new Error('Unsupported preview language: ' + selected);
+  await mkdir(destination, { recursive: true });
+  for (const locale of locales) {
+    const svg = renderDemo({ locale });
+    const output = destination instanceof URL ? new URL(PREVIEW_FILES[locale], destination) : path.join(destination, PREVIEW_FILES[locale]);
+    await writeFile(output, svg);
+    console.log('Generated ' + PREVIEW_FILES[locale] + ' — 2056×1250; synthetic data, sensitive fields redacted.');
+  }
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try { await main(process.argv.slice(2)); }
+  catch (error) { console.error(error.message); process.exitCode = 1; }
+}
