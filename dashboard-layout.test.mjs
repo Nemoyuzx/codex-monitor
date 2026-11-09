@@ -55,95 +55,78 @@ test('details retain both task names and long values rather than truncating the 
   assert.ok(rows.every(row => visLen(row) <= 48));
 });
 
-test('information tables keep two aligned, left-aligned columns without losing wrapped network details', () => {
-  const strip = value => value.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
-  const values = ['en0', 'https://proxy.example.test/代理/切换/configuration-for-network-monitoring.pac?profile=desktop&mode=rule',
-    '2001:db8:1234:5678:90ab:cdef:1234:5678', '192.0.2.53 · 198.51.100.53 · 2001:db8::53', 'HTTP 204 · 368ms'];
-  for (const labels of [
-    { title: 'IP · 路由 · 代理', table: { label: '项目', value: '内容' }, rows: ['网络接口', 'HTTP 代理', '本机 IPv6', '系统 DNS', '直连 HTTPS'] },
-    { title: 'IP · routes · proxies', table: { label: 'Item', value: 'Value' }, rows: ['Interface', 'Monitor environment proxy', 'Local IPv6', 'System DNS', 'Direct HTTPS'] },
-  ]) for (const width of [28, 48, 73, 98]) {
-    const section = { title: labels.title, table: labels.table, tone: 'cyan',
-      rows: labels.rows.map((label, i) => ({ label, value: values[i], tone: i === 4 ? 'green' : 'cyan', separator: i === 4 })) };
-    const plain = renderInformationSections([section], { width });
-    const colored = renderInformationSections([section], { width, color: true });
-    assert.deepEqual(colored.map(strip), plain, 'color must not move table cells');
-    assert.ok(colored.some(line => line.includes('\x1b[32m')), 'probe success keeps its tone');
-    assert.ok(colored.every(line => visLen(line) <= width));
-    const body = plain.filter(line => line.startsWith('│'));
-    assert.ok(body.length > section.rows.length, 'long values wrap onto continuation rows');
-    const columns = line => [...line.matchAll(/│/g)].map(match => visLen(line.slice(0, match.index)));
-    for (const line of body) assert.deepEqual(columns(line), columns(body[0]), 'both column boundaries stay fixed');
-    const cells = body.slice(1).map(line => line.split('│').slice(1, -1));
-    const content = cells.map(cell => cell[1].trim()).join('').replace(/\s/g, '');
-    const items = cells.map(cell => cell[0].trim()).join('').replace(/\s/g, '');
-    for (const value of values) assert.ok(content.includes(value.replace(/\s/g, '')), value);
-    for (const label of labels.rows) assert.ok(items.includes(label.replace(/\s/g, '')), label);
-    assert.ok(cells.some(cell => /^ en0\s+$/.test(cell[1])), 'short values start at the left edge of the content cell');
-    assert.ok(cells.some(cell => !cell[0].trim() && cell[1].trim()), 'continuation rows do not repeat their item label');
-    assert.equal(plain.filter(line => line.startsWith('├')).length, 2, 'groups have a visible dividing rule');
+test('adaptive pairs fit equal halves exactly and promote an oversized item to full width', () => {
+  for (const [width, rightSize] of [[23, 7], [24, 8]]) {
+    const section = { title: 'IP', rowLayout: 'adaptive', rows: [{ label: 'A', value: 'x'.repeat(7) }, { label: 'B', value: 'y'.repeat(rightSize) }] };
+    const body = renderInformationSections([section], { width }).slice(1);
+    assert.equal(body.length, 1);
+    const halves = body[0].split(' │ ');
+    assert.equal(halves.length, 2);
+    assert.equal(visLen(halves[0]), 10);
+    assert.equal(visLen(halves[1]), width === 23 ? 10 : 11);
+    for (const index of [0, 1]) {
+      const enlarged = structuredClone(section);
+      enlarged.rows[index].value += 'z';
+      const full = renderInformationSections([enlarged], { width }).slice(1);
+      assert.equal(full.length, 2, 'one character over the available half width prevents pairing');
+      assert.ok(full.every(line => !line.includes('│') && visLen(line) <= width));
+      assert.ok(full[index].includes(enlarged.rows[index].value), 'a full-width address stays unbroken');
+    }
   }
 });
 
-test('narrow information tables fall back without changing ordinary information sections', () => {
-  const section = { title: '网络', rows: [{ label: '本机 IPv6', value: '2001:db8:1234:5678::90ab' },
-    { label: 'HTTPS', value: 'HTTP 204 · 368ms', tone: 'green', separator: true }] };
-  for (const color of [false, true]) for (const width of [12, 27]) {
-    const ordinary = renderInformationSections([section], { width, color });
-    const table = renderInformationSections([{ ...section, table: { label: '项目', value: '内容' } }], { width, color });
-    assert.deepEqual(table, ordinary);
-    assert.ok(table.every(line => visLen(line) <= width));
-  }
-  const mixed = renderInformationSections([
-    { ...section, table: { label: '项目', value: '内容' } },
-    { title: '任务', rows: [{ label: '正在运行', value: '3' }, '自定义行'] },
-  ], { width: 48 });
-  const ordinary = renderInformationSections([{ title: '任务', rows: [{ label: '正在运行', value: '3' }, '自定义行'] }], { width: 48 });
-  assert.deepEqual(mixed.slice(-ordinary.length), ordinary);
-  assert.ok(!ordinary.join('').includes('│'));
-});
-
-test('four-column tables retain each network item once and keep odd groups separate', () => {
-  const strip = value => value.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
-  const compact = value => value.replace(/\s/g, '');
-  const section = { title: 'IP · 路由 · 代理', table: { label: '项目', value: '内容', pairs: 2 }, tone: 'cyan', rows: [
-    { label: '网络接口', value: 'en0-table' },
-    { label: 'PAC 配置', value: 'https://proxy.example.test/代理/切换/desktop-configuration.pac?profile=workstation&mode=rule' },
-    { label: '本机 IPv6', value: '2001:db8:1234:5678:90ab:cdef:1234:5678' },
-    { label: '直连状态', value: 'HTTP 204 · 368ms', tone: 'green', separator: true },
-    { label: 'System DNS', value: '192.0.2.53 · 198.51.100.53 · 2001:db8::53' },
-    { label: '代理状态', value: '部分目标可达，需要检查 HTTPS', tone: 'yellow' },
+test('adaptive rows preserve short-long-short-short order and stop pairing at group boundaries', () => {
+  const section = { title: 'IP', rowLayout: 'adaptive', rows: [
+    { label: 'A', value: 'first' },
+    { label: 'B', value: 'http://127.0.0.1:7890' },
+    { label: 'C', value: 'third' },
+    { label: 'D', value: 'fourth' },
+    { label: 'E', value: 'fifth' },
+    { label: 'F', value: 'sixth', separator: true },
+    { label: 'G', value: 'seventh' },
   ] };
-  for (const width of [64, 73, 98, 140]) {
-    const plain = renderInformationSections([section], { width });
+  const body = renderInformationSections([section], { width: 43 }).slice(1);
+  assert.equal(body.length, 6);
+  assert.ok(body[0].startsWith('A') && body[0].endsWith('first') && !body[0].includes('│'));
+  assert.ok(body[1].startsWith('B') && body[1].includes(section.rows[1].value) && !body[1].includes('│'));
+  assert.ok(body[2].startsWith('C') && body[2].includes(' │ D'));
+  assert.ok(body[3].startsWith('E') && !body[3].includes('│'));
+  assert.equal(body[4], '');
+  assert.ok(body[5].startsWith('F') && body[5].includes(' │ G'));
+  const content = body.join('');
+  for (const row of section.rows) assert.equal(content.split(row.value).length - 1, 1, row.value);
+});
+
+test('adaptive layout measures colored CJK and emoji while retaining full-width and wrapped URLs', () => {
+  const strip = value => value.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+  const url = 'https://proxy.example.test/代理/desktop-configuration.pac?profile=workstation&mode=rule';
+  const section = { title: '网络', rowLayout: 'adaptive', tone: 'cyan', rows: [
+    { label: '\x1b[35m网络 🌐\x1b[0m', value: '192.0.2.3', tone: 'green' },
+    { label: '状態', value: 'e\u0301 · 👩‍💻', tone: 'yellow' },
+    { label: 'PAC', value: url, separator: true },
+  ] };
+  for (const width of [48, 98]) {
     const colored = renderInformationSections([section], { width, color: true });
-    assert.deepEqual(colored.map(strip), plain);
+    const plain = renderInformationSections([section], { width }).map(strip);
+    assert.deepEqual(colored.map(strip), plain, 'ANSI styles do not affect packing');
     assert.ok(colored.every(line => visLen(line) <= width));
+    assert.ok(plain[1].includes(' │ ') && plain[1].includes('🌐') && plain[1].includes('👩‍💻'));
+    assert.ok(plain.join('').includes(url), 'wrapped URL chunks preserve the complete original address');
+    if (width === 98) assert.ok(plain.some(line => line.includes(url)), 'an address that fits full width stays on one line');
     for (const code of [32, 33]) assert.ok(colored.some(line => line.includes(`\x1b[${code}m`)));
-    const body = plain.filter(line => line.startsWith('│'));
-    const columns = line => [...line.matchAll(/│/g)].map(match => visLen(line.slice(0, match.index)));
-    assert.equal(columns(body[0]).length, 5, 'two item/content pairs have four cells');
-    for (const line of body) assert.deepEqual(columns(line), columns(body[0]));
-    const groups = [[]];
-    for (const line of plain) {
-      if (line.startsWith('├')) groups.push([]);
-      else if (line.startsWith('│')) groups.at(-1).push(line.split('│').slice(1, -1));
-    }
-    assert.equal(groups.length, 3, 'the header and both odd-length groups stay separate');
-    for (const [index, cells] of groups.slice(1).entries()) {
-      const labels = [0, 2].map(column => compact(cells.map(row => row[column].trim()).join(''))).join('|');
-      const values = [1, 3].map(column => compact(cells.map(row => row[column].trim()).join(''))).join('|');
-      for (const row of section.rows.slice(index * 3, index * 3 + 3)) {
-        assert.equal(labels.split(compact(row.label)).length - 1, 1, row.label);
-        assert.equal(values.split(compact(row.value)).length - 1, 1, row.value);
-      }
-      assert.ok(!cells.at(-1)[2].trim() && !cells.at(-1)[3].trim(), 'the final odd item leaves the other pair empty');
-    }
   }
-  for (const width of [28, 48, 63]) {
-    const twoColumns = { ...section, table: { ...section.table, pairs: 1 } };
-    assert.deepEqual(renderInformationSections([section], { width }), renderInformationSections([twoColumns], { width }));
+  const ungrouped = { ...section, rows: section.rows.map(({ separator, ...row }) => row) };
+  for (const width of [12, 20]) {
+    const adaptive = renderInformationSections([ungrouped], { width, color: true });
+    const ordinary = renderInformationSections([{ ...ungrouped, rowLayout: undefined }], { width, color: true });
+    assert.deepEqual(adaptive, ordinary, 'narrow windows retain the original single-item layout');
+    assert.ok(adaptive.every(line => visLen(line) <= width));
   }
+  const ordinary = { title: '任务', rows: [{ label: '运行中', value: '3' }, '自定义行'] };
+  const mixed = renderInformationSections([section, ordinary], { width: 48 });
+  const standalone = renderInformationSections([ordinary], { width: 48 });
+  assert.deepEqual(mixed.slice(-standalone.length), standalone);
+  assert.ok(!standalone.join('').includes('│'));
 });
 
 test('both text columns scroll while the header stays fixed and bounds remain valid', () => {

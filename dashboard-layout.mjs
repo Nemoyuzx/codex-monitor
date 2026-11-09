@@ -46,42 +46,31 @@ export function wrapTerminalLine(text, width) {
   return rows;
 }
 
-function renderInformationTable(section, width, paint, tones) {
-  const labels = [section.table.label, ...section.rows.map(row => row.label || '')];
-  const pairs = section.table.pairs === 2 && width >= 64 ? 2 : 1;
-  const available = width - (pairs * 6 + 1);
-  const widths = Array.from({ length: pairs }, (_, index) => {
-    const space = Math.floor(available / pairs) + (index < available % pairs ? 1 : 0);
-    const labelWidth = Math.min(Math.max(...labels.map(visLen)), Math.floor(space * (pairs === 2 ? 0.48 : 0.4)));
-    return [labelWidth, space - labelWidth];
-  }).flat();
-  const border = (left, middle, right) => paint('2', left + widths.map(size => '─'.repeat(size + 2)).join(middle) + right);
-  const result = [border('┌', '┬', '┐')];
-  const append = (entries, header = false) => {
-    const cells = Array.from({ length: pairs }, (_, index) => {
-      const row = entries[index];
-      const code = header ? '1' : tones[row?.tone] || tones[section.tone] || 36;
-      return [wrapTerminalLine(row?.label || '', widths[index * 2]),
-        wrapTerminalLine(row ? String(row.value ?? '—') : '', widths[index * 2 + 1]).map(value => paint(code, value))];
-    }).flat();
-    for (let i = 0; i < Math.max(...cells.map(cell => cell.length)); i++) {
-      result.push(paint('2', '│ ') + cells.map((cell, index) => padVis(cell[i] || '', widths[index])).join(paint('2', ' │ ')) + paint('2', ' │'));
-    }
-  };
-  append(Array(pairs).fill(section.table), true);
-  result.push(border('├', '┼', '┤'));
-  let pending = [];
-  const flush = () => {
-    if (pending.length) append(pending);
-    pending = [];
-  };
-  for (const row of section.rows) {
-    if (row.separator) { flush(); result.push(border('├', '┼', '┤')); }
-    pending.push(row);
-    if (pending.length === pairs) flush();
+function renderInformationRow(row, width, paint, tones, tone) {
+  if (typeof row === 'string') return wrapTerminalLine(row, width);
+  const label = row.label || '', value = String(row.value ?? '—');
+  const code = tones[row.tone] || tones[tone] || 36;
+  if (!label) return wrapTerminalLine(paint(code, value), width);
+  if (visLen(label) + visLen(value) + 2 <= width) return [padVis(label, width - visLen(value)) + paint(code, value)];
+  return [...wrapTerminalLine(label, width), ...wrapTerminalLine(paint(code, '  ' + value), width)];
+}
+
+function renderAdaptiveInformation(section, width, paint, tones) {
+  const leftWidth = Math.floor((width - 3) / 2), rightWidth = width - leftWidth - 3;
+  const fits = (row, space) => row && typeof row !== 'string' && row.label
+    && !/[\r\n]/.test(row.label + String(row.value ?? '—'))
+    && visLen(row.label) + visLen(String(row.value ?? '—')) + 2 <= space;
+  const result = [];
+  for (let i = 0; i < section.rows.length; i++) {
+    const row = section.rows[i], next = section.rows[i + 1];
+    if (row.separator && result.length) result.push('');
+    if (fits(row, leftWidth) && fits(next, rightWidth) && !next.separator) {
+      const left = renderInformationRow(row, leftWidth, paint, tones, section.tone)[0];
+      const right = renderInformationRow(next, rightWidth, paint, tones, section.tone)[0];
+      result.push(padVis(left, leftWidth) + paint('2', ' │ ') + right);
+      i++;
+    } else result.push(...renderInformationRow(row, width, paint, tones, section.tone));
   }
-  flush();
-  result.push(border('└', '┴', '┘'));
   return result;
 }
 
@@ -94,21 +83,11 @@ export function renderInformationSections(sections, { width, color = false }) {
     if (result.length) result.push('');
     const title = '▍' + section.title + ' ';
     result.push(paint('1;' + (tones[section.tone] || 36), truncVis(title, width)) + paint('2', '─'.repeat(Math.max(0, width - visLen(title)))));
-    if (section.table && width >= 28) {
-      result.push(...renderInformationTable(section, width, paint, tones));
+    if (section.rowLayout === 'adaptive') {
+      result.push(...renderAdaptiveInformation(section, width, paint, tones));
       continue;
     }
-    for (const row of section.rows) {
-      if (typeof row === 'string') { result.push(...wrapTerminalLine(row, width)); continue; }
-      const label = row.label || '', value = String(row.value ?? '—');
-      if (!label) result.push(...wrapTerminalLine(paint(tones[row.tone] || tones[section.tone] || 36, value), width));
-      else if (visLen(label) + visLen(value) + 2 <= width) {
-        result.push(padVis(label, width - visLen(value)) + paint(tones[row.tone] || tones[section.tone] || 36, value));
-      } else {
-        result.push(...wrapTerminalLine(label, width));
-        result.push(...wrapTerminalLine(paint(tones[row.tone] || tones[section.tone] || 36, '  ' + value), width));
-      }
-    }
+    for (const row of section.rows) result.push(...renderInformationRow(row, width, paint, tones, section.tone));
   }
   return result;
 }
