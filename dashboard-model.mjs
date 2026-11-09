@@ -156,9 +156,9 @@ function networkProbeRows(state, compact, now) {
   let proxyIndex = 0;
   for (const route of [result.direct, ...(result.proxies || [])].filter(Boolean)) {
     const label = route.kind === 'direct' ? t('直连') : t('代理{index}', { index: ++proxyIndex });
-    if (route.kind !== 'direct') rows.push(row(t('{route} 路径', { route: label }), route.endpoint || '—'));
+    if (route.kind !== 'direct') rows.push(row(t('{route} 路径', { route: label }), route.endpoint || '—', { separator: true }));
     rows.push(row(t('{route} 实测状态', { route: label }), ({ ok: t('两个目标均通过'), partial: t('部分目标可达'), failed: t('两个目标均未通过') })[route.status] || '—',
-      { tone: route.status === 'ok' ? 'green' : 'yellow' }));
+      { tone: route.status === 'ok' ? 'green' : 'yellow', separator: route.kind === 'direct' }));
     rows.push(row(t('{route} 公网 IP', { route: label }), route.publicIp || (route.ipLookup?.status === 'ok' ? '—' : '— · ' + (failures[route.ipLookup?.status] || t('查询未完成')))));
     rows.push(row(t('{route} HTTPS', { route: label }), describe(route.connectivity),
       { tone: route.connectivity?.status === 'ok' ? 'green' : 'yellow' }));
@@ -220,7 +220,9 @@ function networkRows(details, compact, networkProbes, now) {
       row(t('网络配置采集时间'), Number.isFinite(details?.sampledAt) ? new Date(details.sampledAt).toLocaleTimeString(getLocale(), { hour12: false }) : '—'));
   }
   rows.push(row(t('代理口径'), t('配置不代表应用实际请求路径；下方为独立实测')));
-  rows.push(...networkProbeRows(networkProbes, compact, now));
+  const probeRows = networkProbeRows(networkProbes, compact, now);
+  probeRows[0].separator = true;
+  rows.push(...probeRows);
   return rows;
 }
 
@@ -296,7 +298,8 @@ function buildLocalizedDashboard({ host, activity, performance, sys, tm, load, p
     for (const [source, available] of Object.entries(activity?.availability || {})) diagnosticRows.push(row(t('数据源 {source}', { source }), available ? t('只读可用') : t('不可用'), { tone: available ? 'green' : 'yellow', priority: 50 }));
   }
   const diagnostics = { title: t('链路与告警'), tag: 'HEALTH', tone: 'yellow', priority: 80, rows: diagnosticRows };
-  const network = { title: t('IP · 路由 · 代理'), tag: 'NETWORK', tone: 'cyan', priority: 75, rows: networkRows(networkDetails, view !== 'diagnostics', networkProbes, now) };
+  const network = { title: t('IP · 路由 · 代理'), tag: 'NETWORK', tone: 'cyan', priority: 75,
+    table: { label: t('项目'), value: t('内容') }, rows: networkRows(networkDetails, view !== 'diagnostics', networkProbes, now) };
   const pages = { overview: [hostSection, codexSection, tasks, tools, processes, diagnostics, perf, network],
     host: [hostSection, network, processes], tasks: [tasks, tools, perf], diagnostics: [network, diagnostics, tools, perf] };
   const model = { sections: pages[view] || pages.overview, times: hist.at || [], now, windowSeconds, locale: getLocale() };

@@ -1,5 +1,7 @@
 // Only built-in UI strings are localized. Collector fields and user content stay raw.
 const entries = [
+  ['项目', 'Item', '項目', '項目'],
+  ['内容', 'Details', '內容', '内容'],
   ['逐核 CPU', 'CPU by core', '逐核 CPU', 'コア別 CPU'],
   ['进行中 / 陈旧记录', 'Running / stale records', '進行中 / 陳舊記錄', '実行中 / 古い記録'],
   ['未归档 / 主聊天 / 子代理', 'Unarchived / chats / agents', '未封存 / 主聊天 / 子代理', '未アーカイブ / チャット / エージェント'],

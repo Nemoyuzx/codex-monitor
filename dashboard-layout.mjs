@@ -46,6 +46,30 @@ export function wrapTerminalLine(text, width) {
   return rows;
 }
 
+function renderInformationTable(section, width, paint, tones) {
+  const labels = [section.table.label, ...section.rows.map(row => row.label || '')];
+  const labelWidth = Math.min(Math.max(...labels.map(visLen)), Math.floor((width - 7) * 0.4));
+  const valueWidth = width - labelWidth - 7;
+  const border = (left, middle, right) => paint('2', left + '─'.repeat(labelWidth + 2) + middle + '─'.repeat(valueWidth + 2) + right);
+  const result = [border('┌', '┬', '┐')];
+  const append = (label, value, code) => {
+    const labels = wrapTerminalLine(label, labelWidth);
+    const values = wrapTerminalLine(value, valueWidth);
+    for (let i = 0; i < Math.max(labels.length, values.length); i++) {
+      result.push(paint('2', '│ ') + padVis(labels[i] || '', labelWidth) + paint('2', ' │ ')
+        + padVis(paint(code, values[i] || ''), valueWidth) + paint('2', ' │'));
+    }
+  };
+  append(section.table.label, section.table.value, '1');
+  result.push(border('├', '┼', '┤'));
+  for (const row of section.rows) {
+    if (row.separator) result.push(border('├', '┼', '┤'));
+    append(row.label || '', String(row.value ?? '—'), tones[row.tone] || tones[section.tone] || 36);
+  }
+  result.push(border('└', '┴', '┘'));
+  return result;
+}
+
 export function renderInformationSections(sections, { width, color = false }) {
   const paint = (code, text) => color ? '\x1b[' + code + 'm' + text + '\x1b[0m' : text;
   const tones = { cyan: 36, magenta: 35, green: 32, yellow: 33, red: 31 };
@@ -55,6 +79,10 @@ export function renderInformationSections(sections, { width, color = false }) {
     if (result.length) result.push('');
     const title = '▍' + section.title + ' ';
     result.push(paint('1;' + (tones[section.tone] || 36), truncVis(title, width)) + paint('2', '─'.repeat(Math.max(0, width - visLen(title)))));
+    if (section.table && width >= 28) {
+      result.push(...renderInformationTable(section, width, paint, tones));
+      continue;
+    }
     for (const row of section.rows) {
       if (typeof row === 'string') { result.push(...wrapTerminalLine(row, width)); continue; }
       const label = row.label || '', value = String(row.value ?? '—');
