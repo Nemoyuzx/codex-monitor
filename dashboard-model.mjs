@@ -299,7 +299,7 @@ function buildLocalizedDashboard({ host, activity, performance, sys, tm, load, p
   }
   const diagnostics = { title: t('链路与告警'), tag: 'HEALTH', tone: 'yellow', priority: 80, rows: diagnosticRows };
   const network = { title: t('IP · 路由 · 代理'), tag: 'NETWORK', tone: 'cyan', priority: 75,
-    table: { label: t('项目'), value: t('内容') }, rows: networkRows(networkDetails, view !== 'diagnostics', networkProbes, now) };
+    table: { label: t('项目'), value: t('内容'), pairs: 2 }, rows: networkRows(networkDetails, view !== 'diagnostics', networkProbes, now) };
   const pages = { overview: [hostSection, codexSection, tasks, tools, processes, diagnostics, perf, network],
     host: [hostSection, network, processes], tasks: [tasks, tools, perf], diagnostics: [network, diagnostics, tools, perf] };
   const model = { sections: pages[view] || pages.overview, times: hist.at || [], now, windowSeconds, locale: getLocale() };

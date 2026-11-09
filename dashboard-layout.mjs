@@ -48,24 +48,39 @@ export function wrapTerminalLine(text, width) {
 
 function renderInformationTable(section, width, paint, tones) {
   const labels = [section.table.label, ...section.rows.map(row => row.label || '')];
-  const labelWidth = Math.min(Math.max(...labels.map(visLen)), Math.floor((width - 7) * 0.4));
-  const valueWidth = width - labelWidth - 7;
-  const border = (left, middle, right) => paint('2', left + '─'.repeat(labelWidth + 2) + middle + '─'.repeat(valueWidth + 2) + right);
+  const pairs = section.table.pairs === 2 && width >= 64 ? 2 : 1;
+  const available = width - (pairs * 6 + 1);
+  const widths = Array.from({ length: pairs }, (_, index) => {
+    const space = Math.floor(available / pairs) + (index < available % pairs ? 1 : 0);
+    const labelWidth = Math.min(Math.max(...labels.map(visLen)), Math.floor(space * (pairs === 2 ? 0.48 : 0.4)));
+    return [labelWidth, space - labelWidth];
+  }).flat();
+  const border = (left, middle, right) => paint('2', left + widths.map(size => '─'.repeat(size + 2)).join(middle) + right);
   const result = [border('┌', '┬', '┐')];
-  const append = (label, value, code) => {
-    const labels = wrapTerminalLine(label, labelWidth);
-    const values = wrapTerminalLine(value, valueWidth);
-    for (let i = 0; i < Math.max(labels.length, values.length); i++) {
-      result.push(paint('2', '│ ') + padVis(labels[i] || '', labelWidth) + paint('2', ' │ ')
-        + padVis(paint(code, values[i] || ''), valueWidth) + paint('2', ' │'));
+  const append = (entries, header = false) => {
+    const cells = Array.from({ length: pairs }, (_, index) => {
+      const row = entries[index];
+      const code = header ? '1' : tones[row?.tone] || tones[section.tone] || 36;
+      return [wrapTerminalLine(row?.label || '', widths[index * 2]),
+        wrapTerminalLine(row ? String(row.value ?? '—') : '', widths[index * 2 + 1]).map(value => paint(code, value))];
+    }).flat();
+    for (let i = 0; i < Math.max(...cells.map(cell => cell.length)); i++) {
+      result.push(paint('2', '│ ') + cells.map((cell, index) => padVis(cell[i] || '', widths[index])).join(paint('2', ' │ ')) + paint('2', ' │'));
     }
   };
-  append(section.table.label, section.table.value, '1');
+  append(Array(pairs).fill(section.table), true);
   result.push(border('├', '┼', '┤'));
+  let pending = [];
+  const flush = () => {
+    if (pending.length) append(pending);
+    pending = [];
+  };
   for (const row of section.rows) {
-    if (row.separator) result.push(border('├', '┼', '┤'));
-    append(row.label || '', String(row.value ?? '—'), tones[row.tone] || tones[section.tone] || 36);
+    if (row.separator) { flush(); result.push(border('├', '┼', '┤')); }
+    pending.push(row);
+    if (pending.length === pairs) flush();
   }
+  flush();
   result.push(border('└', '┴', '┘'));
   return result;
 }

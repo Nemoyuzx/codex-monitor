@@ -103,6 +103,49 @@ test('narrow information tables fall back without changing ordinary information 
   assert.ok(!ordinary.join('').includes('│'));
 });
 
+test('four-column tables retain each network item once and keep odd groups separate', () => {
+  const strip = value => value.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+  const compact = value => value.replace(/\s/g, '');
+  const section = { title: 'IP · 路由 · 代理', table: { label: '项目', value: '内容', pairs: 2 }, tone: 'cyan', rows: [
+    { label: '网络接口', value: 'en0-table' },
+    { label: 'PAC 配置', value: 'https://proxy.example.test/代理/切换/desktop-configuration.pac?profile=workstation&mode=rule' },
+    { label: '本机 IPv6', value: '2001:db8:1234:5678:90ab:cdef:1234:5678' },
+    { label: '直连状态', value: 'HTTP 204 · 368ms', tone: 'green', separator: true },
+    { label: 'System DNS', value: '192.0.2.53 · 198.51.100.53 · 2001:db8::53' },
+    { label: '代理状态', value: '部分目标可达，需要检查 HTTPS', tone: 'yellow' },
+  ] };
+  for (const width of [64, 73, 98, 140]) {
+    const plain = renderInformationSections([section], { width });
+    const colored = renderInformationSections([section], { width, color: true });
+    assert.deepEqual(colored.map(strip), plain);
+    assert.ok(colored.every(line => visLen(line) <= width));
+    for (const code of [32, 33]) assert.ok(colored.some(line => line.includes(`\x1b[${code}m`)));
+    const body = plain.filter(line => line.startsWith('│'));
+    const columns = line => [...line.matchAll(/│/g)].map(match => visLen(line.slice(0, match.index)));
+    assert.equal(columns(body[0]).length, 5, 'two item/content pairs have four cells');
+    for (const line of body) assert.deepEqual(columns(line), columns(body[0]));
+    const groups = [[]];
+    for (const line of plain) {
+      if (line.startsWith('├')) groups.push([]);
+      else if (line.startsWith('│')) groups.at(-1).push(line.split('│').slice(1, -1));
+    }
+    assert.equal(groups.length, 3, 'the header and both odd-length groups stay separate');
+    for (const [index, cells] of groups.slice(1).entries()) {
+      const labels = [0, 2].map(column => compact(cells.map(row => row[column].trim()).join(''))).join('|');
+      const values = [1, 3].map(column => compact(cells.map(row => row[column].trim()).join(''))).join('|');
+      for (const row of section.rows.slice(index * 3, index * 3 + 3)) {
+        assert.equal(labels.split(compact(row.label)).length - 1, 1, row.label);
+        assert.equal(values.split(compact(row.value)).length - 1, 1, row.value);
+      }
+      assert.ok(!cells.at(-1)[2].trim() && !cells.at(-1)[3].trim(), 'the final odd item leaves the other pair empty');
+    }
+  }
+  for (const width of [28, 48, 63]) {
+    const twoColumns = { ...section, table: { ...section.table, pairs: 1 } };
+    assert.deepEqual(renderInformationSections([section], { width }), renderInformationSections([twoColumns], { width }));
+  }
+});
+
 test('both text columns scroll while the header stays fixed and bounds remain valid', () => {
   const header = ['状态头部'];
   const primary = Array.from({ length: 100 }, (_, i) => '主信息 ' + i);
