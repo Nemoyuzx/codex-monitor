@@ -4,8 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { statusMessages } from './locales/status.mjs';
+import { truncVis } from './resource-panel.mjs';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
 const languages=['zh-CN','zh-TW','en','ja'];
@@ -20,7 +21,7 @@ function isolated(callback){
   for(const name of ['sysctl','memory_pressure','vm_stat','top','ps','pgrep','ioreg','netstat','scutil','route','ifconfig','pmset','du','df','curl']) fs.symlinkSync(stub,path.join(bin,name));
   const env={...process.env,CODEX_HOME:directory,PATH:bin,LC_ALL:'C',LANG:'C',CODEX_MONITOR_LANG:'zh-CN',
     HTTP_PROXY:'',HTTPS_PROXY:'',ALL_PROXY:'',http_proxy:'',https_proxy:'',all_proxy:''};
-  const run=args=>spawnSync(process.execPath,[path.join(root,'bin/codex-monitor.mjs'),...args],{
+  const run=(args,nodeArgs=[])=>spawnSync(process.execPath,[...nodeArgs,path.join(root,'bin/codex-monitor.mjs'),...args],{
     cwd:directory,env,encoding:'utf8',timeout:20_000,maxBuffer:2*1024*1024
   });
   try{return callback(run,directory);}finally{fs.rmSync(directory,{recursive:true,force:true});}
@@ -49,6 +50,40 @@ test('actual one-shot UI localizes without unresolved placeholders or hidden Chi
       assert.ok(result.stdout.includes(statusMessages.title[locale]));
       assert.ok(!/\{[A-Za-z0-9_]+\}/.test(result.stdout),locale+' unresolved message field');
       if(locale==='en') assert.ok(!/\p{Script=Han}/u.test(result.stdout),'English CLI contains untranslated built-in text');
+    }
+  });
+});
+
+test('actual diagnostics primary uses compact adaptive sections in every language and a wide terminal',()=>{
+  isolated((run,directory)=>{
+    const bootstrap=path.join(directory,'wide-terminal.mjs');
+    fs.writeFileSync(bootstrap,'Object.defineProperty(process.stdout,"columns",{value:251,configurable:true});\n');
+    const variants=[...languages.map(locale=>({locale,width:61,nodeArgs:[],color:'--no-color'})),
+      {locale:'en',width:73,nodeArgs:['--import',pathToFileURL(bootstrap).href],color:'--color'}];
+    const strip=value=>value.replace(/\x1b\[[0-9;?]*[A-Za-z]/g,'');
+    const compact=value=>value.replace(/\s/g,'');
+    for(const {locale,width,nodeArgs,color} of variants){
+      const result=run(['--once','--view','diagnostics','--no-probes','--lang',locale,color,
+        '--metrics-db',path.join(directory,'missing.sqlite')],nodeArgs);
+      assert.equal(result.status,0,result.stderr);
+      if(color==='--color') assert.ok(result.stdout.includes('\x1b['));
+      const left=result.stdout.split('\n').map(line=>truncVis(strip(line),width).trimEnd());
+      const titles=['processesTitle','networkTitle','storageTitle','verdictTitle'];
+      const positions=titles.map(key=>left.findIndex(line=>line.startsWith('▍'+statusMessages[key][locale])));
+      assert.ok(positions.every((index,i)=>index>=0&&(!i||index>positions[i-1])),locale+': all four primary headings must use the information renderer');
+      const next=left.findIndex((line,i)=>i>positions[3]&&line.startsWith('▍'));
+      const end=next<0?left.findLastIndex(Boolean)+1:next;
+      const primary=left.slice(positions[0],end);
+      assert.ok(primary.every(Boolean),locale+': no empty rows inside or between diagnostics primary sections');
+      const text=compact(primary.join(''));
+      for(const key of ['probesDisabled','noSpeed','verdictIncomplete','httpDisabled']){
+        assert.ok(text.includes(compact(statusMessages[key][locale])),locale+': '+key);
+      }
+      const tokenLabel=compact(statusMessages.tokenTotal[locale].split(':')[0]);
+      assert.ok(primary.some(line=>compact(line).includes(tokenLabel)&&line.includes('—')),locale+': unavailable cumulative tokens stay unknown');
+      for(const level of ['ERROR','WARN','INFO','DEBUG','TRACE']) assert.ok(text.includes(level+'=—'),locale+': '+level);
+      assert.ok(!/\{[A-Za-z0-9_]+\}/.test(primary.join('')));
+      if(locale==='en') assert.ok(!/\p{Script=Han}/u.test(primary.join('')));
     }
   });
 });

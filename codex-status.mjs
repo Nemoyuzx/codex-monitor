@@ -374,6 +374,27 @@ async function runOnce() {
   const leftW = twoCol ? dashboardLayout(cols).left : cols;
   // Leave room for the watch footer and its trailing newline to avoid scrolling.
   const lines = [];
+  const diagnosticSections = [];
+  let diagnosticSection;
+  const beginDiagnosticSection = key => {
+    const title = t(key);
+    lines.push('', hdr(title));
+    diagnosticSection = { title, tone: 'cyan', rowLayout: 'adaptive', compact: true, rows: [] };
+    diagnosticSections.push(diagnosticSection);
+  };
+  const diagnosticMessage = (key, values = {}, paint = text => text) => {
+    const template = t(key), text = t(key, values);
+    lines.push(paint(text));
+    const delimiter = template.indexOf(':');
+    const prefix = template.slice(0, delimiter + 1);
+    if (delimiter >= 0 && !/\{[A-Za-z0-9_]+\}/.test(prefix)) {
+      diagnosticSection.rows.push({ label: paint(template.slice(0, delimiter).trim()), value: paint(text.slice(delimiter + 1).trimStart()) });
+    } else diagnosticSection.rows.push(paint(text.trimStart()));
+  };
+  const diagnosticText = text => {
+    lines.push(text);
+    diagnosticSection.rows.push(text.trimStart());
+  };
 
   // 头部
   lines.push(bold(t('title')) + '  ' + cyan(fmtTs(NOW)));
@@ -569,12 +590,11 @@ async function runOnce() {
   try { if (Q) queuedRevs = one(Q.db, 'SELECT count(*) c FROM queued_thread_revisions')?.c ?? null; } catch {}
   const goalsCount = activity.goals.active;
 
-  lines.push('');
-  lines.push(hdr(t('processesTitle')));
-  lines.push(t('processes', { processes: host.processes.available ? 'app-server ×' + bold(String(appServerProc)) + (appServerProc > 0 ? green(' ✓') : red(' ✗')) + ' · exec-server ×' + execServerProc + ' · code-mode-host ×' + codeModeHostProc : dim(t('unavailable')) }));
-  lines.push(t('mcpProcesses', { count: bold(mcpTotal == null ? '—' : String(mcpTotal)), detail: mcpDetail.length ? ' (' + mcpDetail.slice(0, 3).map(d => d.name + ' ×' + d.n).join(', ') + ')' : '', config: dim(t('mcpConfigured', { count: mcpN })) }));
-  lines.push(t('cloudQueue', { count: queuedItems == null ? dim('—') : queuedItems > 0 ? yellow(String(queuedItems)) : green(t('zeroQueue')), revisions: queuedRevs ?? '—' }));
-  lines.push(t('activeGoals', { active: bold(goalsCount == null ? '—' : String(goalsCount)), total: activity.goals.total ?? '—' }));
+  beginDiagnosticSection('processesTitle');
+  diagnosticMessage('processes', { processes: host.processes.available ? 'app-server ×' + bold(String(appServerProc)) + (appServerProc > 0 ? green(' ✓') : red(' ✗')) + ' · exec-server ×' + execServerProc + ' · code-mode-host ×' + codeModeHostProc : dim(t('unavailable')) });
+  diagnosticMessage('mcpProcesses', { count: bold(mcpTotal == null ? '—' : String(mcpTotal)), detail: mcpDetail.length ? ' (' + mcpDetail.slice(0, 3).map(d => d.name + ' ×' + d.n).join(', ') + ')' : '', config: dim(t('mcpConfigured', { count: mcpN })) });
+  diagnosticMessage('cloudQueue', { count: queuedItems == null ? dim('—') : queuedItems > 0 ? yellow(String(queuedItems)) : green(t('zeroQueue')), revisions: queuedRevs ?? '—' });
+  diagnosticMessage('activeGoals', { active: bold(goalsCount == null ? '—' : String(goalsCount)), total: activity.goals.total ?? '—' });
 
   // [4] 网络探针
   let ipcSocket = false;
@@ -586,16 +606,17 @@ async function runOnce() {
   const networkProbes = networkProbeController.getState();
   const legacyProbeState = legacyProbeController.getState();
   const netOk = probeRes.length === 4 && probeRes.every(x => x.status != null);
-  lines.push('');
-  lines.push(hdr(t('networkTitle')));
-  lines.push(t('localIpc', { socket: ipcSocket ? green(t('ipcPresent')) : red(t('ipcMissing')), service: netServiceProc > 0 ? green(t('running')) : red(t('notFound')) }));
-  if (options.noProbes) lines.push(dim(t('probesDisabled')));
-  else if (legacyProbeState.sampling && !probeRes.length) lines.push(dim(t('probesSampling')));
+  beginDiagnosticSection('networkTitle');
+  diagnosticMessage('localIpc', { socket: ipcSocket ? green(t('ipcPresent')) : red(t('ipcMissing')), service: netServiceProc > 0 ? green(t('running')) : red(t('notFound')) });
+  if (options.noProbes) diagnosticMessage('probesDisabled', {}, dim);
+  else if (legacyProbeState.sampling && !probeRes.length) diagnosticMessage('probesSampling', {}, dim);
   for (const result of probeRes) {
     const paint = !result.status ? red : result.status >= 400 ? yellow : green;
-    lines.push('    ' + result.label.padEnd(18) + ': ' + paint(result.status ? 'HTTP ' + result.status : result.error) + ' · ' + result.latencyMs + 'ms');
+    const value = paint(result.status ? 'HTTP ' + result.status : result.error) + ' · ' + result.latencyMs + 'ms';
+    lines.push('    ' + result.label.padEnd(18) + ': ' + value);
+    diagnosticSection.rows.push({ label: result.label, value });
   }
-  if (probeRes.some(result => result.status >= 400)) lines.push(dim(t('httpReachabilityNote')));
+  if (probeRes.some(result => result.status >= 400)) diagnosticMessage('httpReachabilityNote', {}, dim);
 
   // [5] 存储 · 日志 · 用量
   const inv = dbInventory();
@@ -625,29 +646,28 @@ async function runOnce() {
     dfAvail = p[3] || '';
     dfCap = p[4] || '';
   }
-  lines.push('');
-  lines.push(hdr(t('storageTitle')));
-  lines.push(t('tokenTotal', { count: bold(tokenSum == null ? '—' : human(tokenSum)), model: topModel ? t('tokenModel', { model: cyan(topModel) }) : '' }));
-  lines.push(t('tokenDelta', { count: bold(activity.tokens.monitorDelta == null ? '—' : human(activity.tokens.monitorDelta)) }));
+  beginDiagnosticSection('storageTitle');
+  diagnosticMessage('tokenTotal', { count: bold(tokenSum == null ? '—' : human(tokenSum)), model: topModel ? t('tokenModel', { model: cyan(topModel) }) : '' });
+  diagnosticMessage('tokenDelta', { count: bold(activity.tokens.monitorDelta == null ? '—' : human(activity.tokens.monitorDelta)) });
   const measuredSpeed = activity.sessions.rows.map(task => performanceCache.byThread[task.id]?.fields.tokensPerSecond).find(Boolean);
-  lines.push(t('nativeSpeed', { speed: measuredSpeed ? t('cachedSpeed', { speed: measuredSpeed.value.toFixed(1), age: age(measuredSpeed.measuredAt) }) : t('noSpeed') }));
+  diagnosticMessage('nativeSpeed', { speed: measuredSpeed ? t('cachedSpeed', { speed: measuredSpeed.value.toFixed(1), age: age(measuredSpeed.measuredAt) }) : t('noSpeed') });
   {
     const win = Number(cfgVal('model_context_window')) || 0;
     const auto = Number(cfgVal('model_auto_compact_token_limit')) || 0;
     const comps = merged.filter(r => r.item_type === 'contextCompaction').length;
-    lines.push(t('contextWindow', { window: win ? human(win) : '?', threshold: auto ? t('compactionThreshold', { count: human(auto) }) : '', recent: comps > 0 ? t('recentCompactions', { count: comps }) : t('noRecentCompactions') }));
+    diagnosticMessage('contextWindow', { window: win ? human(win) : '?', threshold: auto ? t('compactionThreshold', { count: human(auto) }) : '', recent: comps > 0 ? t('recentCompactions', { count: comps }) : t('noRecentCompactions') });
   }
-  lines.push(t('pageFaults', { faults: bold(fmtSampleRate(faultRate)), input: fmtSampleRate(pageinRate), output: fmtSampleRate(pageoutRate) }));
-  lines.push(t('compressedMemory', { compressed: fmtBytes(compPages * pageSize), original: fmtBytes(compStored * pageSize), swap: swapBytes == null ? '—' : swapBytes > 0 ? yellow(fmtBytes(swapBytes)) : '0' }));
-  if (codexDirSize() > 0) lines.push(t('dataDirectory', { size: bold(fmtBytes(codexDirSize())), db: fmtBytes(dbTotal) }));
-  else lines.push(t('dbFiles', { size: fmtBytes(dbTotal) }));
-  if (topDb) lines.push(t('largestDb', { file: topDb.f, size: bold(fmtBytes(topDb.s)) }));
-  if (topWal && topWal.s > 50 * 1024 * 1024) lines.push(t('walBacklog', { file: yellow(topWal.f + ' ' + fmtBytes(topWal.s)) }));
-  else if (topWal) lines.push(t('largestWal', { file: topWal.f, size: fmtBytes(topWal.s) }));
-  if (dfAvail) lines.push(t('diskFree', { free: green(dfAvail), percent: dfCap }));
-  lines.push(t('logHeartbeat', { age: lastLogSec != null ? cyan(age(lastLogSec * 1000)) : t('none'), errors: errRecent == null ? '—' : errRecent > 0 ? red(String(errRecent)) : '0', warnings: warnRecent == null ? '—' : warnRecent > 0 ? yellow(String(warnRecent)) : '0', info: activity.availability.logs ? lvls.INFO || 0 : '—', debug: activity.availability.logs ? lvls.DEBUG || 0 : '—', trace: activity.availability.logs ? lvls.TRACE || 0 : '—' }));
+  diagnosticMessage('pageFaults', { faults: bold(fmtSampleRate(faultRate)), input: fmtSampleRate(pageinRate), output: fmtSampleRate(pageoutRate) });
+  diagnosticMessage('compressedMemory', { compressed: fmtBytes(compPages * pageSize), original: fmtBytes(compStored * pageSize), swap: swapBytes == null ? '—' : swapBytes > 0 ? yellow(fmtBytes(swapBytes)) : '0' });
+  if (codexDirSize() > 0) diagnosticMessage('dataDirectory', { size: bold(fmtBytes(codexDirSize())), db: fmtBytes(dbTotal) });
+  else diagnosticMessage('dbFiles', { size: fmtBytes(dbTotal) });
+  if (topDb) diagnosticMessage('largestDb', { file: topDb.f, size: bold(fmtBytes(topDb.s)) });
+  if (topWal && topWal.s > 50 * 1024 * 1024) diagnosticMessage('walBacklog', { file: yellow(topWal.f + ' ' + fmtBytes(topWal.s)) });
+  else if (topWal) diagnosticMessage('largestWal', { file: topWal.f, size: fmtBytes(topWal.s) });
+  if (dfAvail) diagnosticMessage('diskFree', { free: green(dfAvail), percent: dfCap });
+  diagnosticMessage('logHeartbeat', { age: lastLogSec != null ? cyan(age(lastLogSec * 1000)) : t('none'), errors: errRecent == null ? '—' : errRecent > 0 ? red(String(errRecent)) : '0', warnings: warnRecent == null ? '—' : warnRecent > 0 ? yellow(String(warnRecent)) : '0', info: activity.availability.logs ? lvls.INFO || 0 : '—', debug: activity.availability.logs ? lvls.DEBUG || 0 : '—', trace: activity.availability.logs ? lvls.TRACE || 0 : '—' });
   if (errSummary.length) {
-    for (const e of errSummary.slice(0, 3)) lines.push(t('recentError', { target: red(clip(String(e.target), 28) + ' ×' + e.c), error: errMsg(e.msg) }));
+    for (const e of errSummary.slice(0, 3)) diagnosticMessage('recentError', { target: red(clip(String(e.target), 28) + ' ×' + e.c), error: errMsg(e.msg) });
   }
 
   // [6] 保守判断
@@ -667,13 +687,12 @@ async function runOnce() {
   else if (activity.turns.recentRunning > 0) verdict = 'verdictWorking';
   else verdict = 'verdictIdle';
 
-  lines.push('');
-  lines.push(hdr(t('verdictTitle')));
-  lines.push('    ' + paintVerdict(verdict));
-  lines.push(dim(t('verdictFacts', { facts: facts.join('; ') })));
-  if (sleepLoopCount >= 3) lines.push(yellow(t('sleepLoop', { count: sleepLoopCount })));
+  beginDiagnosticSection('verdictTitle');
+  diagnosticText('    ' + paintVerdict(verdict));
+  diagnosticMessage('verdictFacts', { facts: facts.join('; ') }, dim);
+  if (sleepLoopCount >= 3) diagnosticMessage('sleepLoop', { count: sleepLoopCount }, yellow);
   if (errRecent > 0 && errSummary.length) {
-    lines.push(dim(t('errorNote', { target: clip(String(errSummary[0].target), 28), error: errMsg(errSummary[0].msg) })));
+    diagnosticMessage('errorNote', { target: clip(String(errSummary[0].target), 28), error: errMsg(errSummary[0].msg) }, dim);
   }
   lines.push('');
 
@@ -682,7 +701,7 @@ async function runOnce() {
   const dashboard = { host, activity, performance: performanceCache, sys, tm, load, pressurePercent: pressurePct, swap, hist, now: NOW,
     probes: probeRes, storage: { dbBytes: dbTotal, walBytes: inv.filter(item => item.f.endsWith('-wal')).reduce((sum, item) => sum + item.s, 0), diskAvailable: dfAvail },
     networkDetails, networkProbes, legacyProbeState, sampleMs, intervalMs: interval * 1000, noProbes: options.noProbes, limit: options.threads };
-  lastRender = { lines, dashboard };
+  lastRender = { lines, dashboard, diagnosticSections };
   lastSnapshot = { at: NOW, host, activity, performance: performanceCache, networkDetails, networkProbes, storage: dashboard.storage, probes: probeRes,
     system: { ...sys, load, physicalMemoryUsedBytes: tm.memUsed ?? null, physicalMemoryPercent: memPct,
       memoryPressureEstimatePercent: pressurePct >= 0 ? pressurePct : null, swap,
@@ -706,7 +725,8 @@ function renderLast() {
   let primary;
   if (uiState.view === 'host') primary = original.slice(6, index('[1]'));
   else if (uiState.view === 'tasks') primary = original.slice(index('[1]'), index('[3]'));
-  else if (uiState.view === 'diagnostics') primary = original.slice(index('[3]'));
+  else if (uiState.view === 'diagnostics') primary = renderInformationSections(lastRender.diagnosticSections,
+    { width: layout.columns === 2 ? layout.primary : layout.left, color: COLOR });
   else {
     primary = original.slice(6, index('[4]'));
     const storageLabels = ['localIpc', 'dataDirectory', 'dbFiles', 'largestDb', 'walBacklog', 'largestWal', 'diskFree', 'compressedMemory', 'contextWindow'].map(key => t(key).split('{')[0]);
