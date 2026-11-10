@@ -77,9 +77,11 @@ export function renderInformationSections(sections, { width, color = false }) {
   const paint = (code, text) => color ? '\x1b[' + code + 'm' + text + '\x1b[0m' : text;
   const tones = { cyan: 36, magenta: 35, green: 32, yellow: 33, red: 31 };
   const result = [];
+  let previousCompact = false;
   for (const section of sections) {
     if (!section.rows?.length) continue;
-    if (result.length) result.push('');
+    if (result.length && !section.compact && !previousCompact) result.push('');
+    previousCompact = Boolean(section.compact);
     const title = '▍' + section.title + ' ';
     result.push(paint('1;' + (tones[section.tone] || 36), truncVis(title, width)) + paint('2', '─'.repeat(Math.max(0, width - visLen(title)))));
     if (section.rowLayout === 'adaptive') {

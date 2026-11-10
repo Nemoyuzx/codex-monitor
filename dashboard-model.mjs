@@ -274,9 +274,9 @@ function buildLocalizedDashboard({ host, activity, performance, sys, tm, load, p
   const hostSection = { title: t('主机资源'), tag: 'HOST', tone: 'cyan', priority: 100, metrics: hostMetrics, rows: hostRows,
     footer: t('压缩 {value} · swap {swap}', { value: bytes(tm?.memComp), swap: bytes(swap?.used) }) };
   const codexSection = { title: t('Codex 资源'), tag: 'CODEX', tone: 'magenta', priority: 95, metrics: codexMetrics };
-  const tasks = { title: t('任务与队列'), tag: 'TASKS', tone: 'cyan', priority: 85, rows: taskRows(activity, now, limit, view === 'overview') };
+  const tasks = { title: t('任务与队列'), tag: 'TASKS', tone: 'cyan', priority: 85, rowLayout: 'adaptive', compact: true, rows: taskRows(activity, now, limit, view === 'overview') };
   const processes = { title: t('Codex 进程排行'), tag: 'PROCESSES', tone: 'magenta', priority: 55, optional: view === 'overview', rows: processRows(host, width, view === 'overview' ? 3 : 10) };
-  const tools = { title: t('工具与性能'), tag: 'TOOLS', tone: 'cyan', priority: 70, rows: toolRows(activity, view === 'overview') };
+  const tools = { title: t('工具与性能'), tag: 'TOOLS', tone: 'cyan', priority: 70, rowLayout: 'adaptive', compact: true, rows: toolRows(activity, view === 'overview') };
   const perf = { title: t('Token 与已采集性能'), tag: 'METRICS', tone: 'magenta', priority: 60, optional: view === 'overview', rows: performanceRows(activity, performance, now) };
   const diagnosticRows = [
     row(t('近10m ERROR / WARN'), number(activity?.alerts?.error10m) + ' / ' + number(activity?.alerts?.warn10m), { tone: activity?.alerts?.error10m > 0 ? 'yellow' : 'green', priority: 100 }),
@@ -297,7 +297,7 @@ function buildLocalizedDashboard({ host, activity, performance, sys, tm, load, p
       ago(now - alert.at) + (alert.count > 1 ? ' ×' + alert.count : ''), { tone: alert.level === 'ERROR' ? 'red' : 'yellow', priority: 50 }));
     for (const [source, available] of Object.entries(activity?.availability || {})) diagnosticRows.push(row(t('数据源 {source}', { source }), available ? t('只读可用') : t('不可用'), { tone: available ? 'green' : 'yellow', priority: 50 }));
   }
-  const diagnostics = { title: t('链路与告警'), tag: 'HEALTH', tone: 'yellow', priority: 80, rows: diagnosticRows };
+  const diagnostics = { title: t('链路与告警'), tag: 'HEALTH', tone: 'yellow', priority: 80, rowLayout: 'adaptive', compact: true, rows: diagnosticRows };
   const network = { title: t('IP · 路由 · 代理'), tag: 'NETWORK', tone: 'cyan', priority: 75,
     rowLayout: 'adaptive', rows: networkRows(networkDetails, view !== 'diagnostics', networkProbes, now) };
   const pages = { overview: [hostSection, codexSection, tasks, tools, processes, diagnostics, perf, network],
