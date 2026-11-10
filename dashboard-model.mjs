@@ -277,7 +277,7 @@ function buildLocalizedDashboard({ host, activity, performance, sys, tm, load, p
   const tasks = { title: t('任务与队列'), tag: 'TASKS', tone: 'cyan', priority: 85, rowLayout: 'adaptive', compact: true, rows: taskRows(activity, now, limit, view === 'overview') };
   const processes = { title: t('Codex 进程排行'), tag: 'PROCESSES', tone: 'magenta', priority: 55, optional: view === 'overview', rows: processRows(host, width, view === 'overview' ? 3 : 10) };
   const tools = { title: t('工具与性能'), tag: 'TOOLS', tone: 'cyan', priority: 70, rowLayout: 'adaptive', compact: true, rows: toolRows(activity, view === 'overview') };
-  const perf = { title: t('Token 与已采集性能'), tag: 'METRICS', tone: 'magenta', priority: 60, optional: view === 'overview', rows: performanceRows(activity, performance, now) };
+  const perf = { title: t('Token 与已采集性能'), tag: 'METRICS', tone: 'magenta', priority: 60, optional: view === 'overview', rowLayout: 'adaptive', compact: true, rows: performanceRows(activity, performance, now) };
   const diagnosticRows = [
     row(t('近10m ERROR / WARN'), number(activity?.alerts?.error10m) + ' / ' + number(activity?.alerts?.warn10m), { tone: activity?.alerts?.error10m > 0 ? 'yellow' : 'green', priority: 100 }),
     row(t('ERROR / WARN · 每分钟'), number(activity?.alerts?.errorPerMinute) + ' / ' + number(activity?.alerts?.warnPerMinute), { priority: 70 }),
