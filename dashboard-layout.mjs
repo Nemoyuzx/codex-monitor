@@ -63,7 +63,6 @@ function renderAdaptiveInformation(section, width, paint, tones) {
   const result = [];
   for (let i = 0; i < section.rows.length; i++) {
     const row = section.rows[i], next = section.rows[i + 1];
-    if (row.separator && result.length) result.push('');
     if (fits(row, leftWidth) && fits(next, rightWidth) && !next.separator) {
       const left = renderInformationRow(row, leftWidth, paint, tones, section.tone)[0];
       const right = renderInformationRow(next, rightWidth, paint, tones, section.tone)[0];

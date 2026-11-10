@@ -86,13 +86,13 @@ test('adaptive rows preserve short-long-short-short order and stop pairing at gr
     { label: 'G', value: 'seventh' },
   ] };
   const body = renderInformationSections([section], { width: 43 }).slice(1);
-  assert.equal(body.length, 6);
+  assert.equal(body.length, 5);
+  assert.ok(body.every(line => line.length > 0), 'group boundaries do not add empty rows');
   assert.ok(body[0].startsWith('A') && body[0].endsWith('first') && !body[0].includes('│'));
   assert.ok(body[1].startsWith('B') && body[1].includes(section.rows[1].value) && !body[1].includes('│'));
   assert.ok(body[2].startsWith('C') && body[2].includes(' │ D'));
   assert.ok(body[3].startsWith('E') && !body[3].includes('│'));
-  assert.equal(body[4], '');
-  assert.ok(body[5].startsWith('F') && body[5].includes(' │ G'));
+  assert.ok(body[4].startsWith('F') && body[4].includes(' │ G'));
   const content = body.join('');
   for (const row of section.rows) assert.equal(content.split(row.value).length - 1, 1, row.value);
 });
