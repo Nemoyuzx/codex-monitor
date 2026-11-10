@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createHostSampler, cpuUsageBetween, parseDiskSnapshot, parseNetworkSnapshot, parsePowerSnapshot } from './host-metrics.mjs';
+import { createHostSampler, cpuUsageBetween, parseDiskSnapshot, parseNetworkSnapshot, parsePowerSnapshot,
+  parseLinuxNetworkSnapshot, parseLinuxDefaultInterface, parseLinuxDiskSnapshot } from './host-metrics.mjs';
 
 const net = (name, incoming, outgoing, address = 'aa:bb:cc:dd:ee:ff') => `${name} 1500 <Link#7> ${address} 7 0 ${incoming} 9 0 ${outgoing} 0`;
 const device = (id, read, write, readOps, writeOps) => `+-o IOBlockStorageDriver <class IOBlockStorageDriver, id ${id}, registered>\n "Statistics" = {"Bytes (Read)"=${read},"Operations (Write)"=${writeOps},"Bytes (Write)"=${write},"Operations (Read)"=${readOps}}`;
@@ -245,4 +246,106 @@ test('power and memory pressure are parsed conservatively and peripheral command
   const unavailable = sampler.sample();
   assert.equal(unavailable.power, null);
   assert.equal(unavailable.pressure, null);
+});
+
+test('Linux proc parsers use route metrics and 512-byte disk sectors while excluding partitions', () => {
+  assert.deepEqual(parseLinuxNetworkSnapshot('Inter-| Receive\n eth0: 100 1 0 0 0 0 0 0 200 2 0 0 0 0 0 0\n bad: nope 1 0 0 0 0 0 0 5 1 0 0 0 0 0 0'),
+    [{ name: 'eth0', inBytes: 100, outBytes: 200 }]);
+  const routes = 'Iface Destination Gateway Flags RefCnt Use Metric Mask\neth0 00000000 0100000A 0003 0 0 200 00000000\nwlan0 00000000 0100000A 0003 0 0 100 00000000';
+  assert.equal(parseLinuxDefaultInterface(routes), 'wlan0');
+  assert.equal(parseLinuxDefaultInterface('', '00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000001 00000064 00000000 00000000 00000003 eth0'), 'eth0');
+  assert.equal(parseLinuxDefaultInterface('eth0 00000000 0100000A 0000 0 0 100 00000000'), null);
+  assert.equal(parseLinuxDefaultInterface('lo 00000000 00000000 0201 0 0 0 00000000'), null);
+  const disk = '8 0 sda 10 0 20 0 30 0 40 0 0 0 0\n8 1 sda1 100 0 200 0 300 0 400 0 0 0 0\n7 0 loop0 100 0 200 0 300 0 400 0 0 0 0';
+  assert.deepEqual(parseLinuxDiskSnapshot(disk, name => name === 'sda'), [{ id: '8:0:sda', readBytes: 10240, writeBytes: 20480, readOps: 10, writeOps: 30 }]);
+  assert.deepEqual(parseLinuxDiskSnapshot(disk, () => { throw Error('missing sysfs'); }), []);
+});
+
+test('Linux host sampler provides routed traffic, physical IO and process tree without Darwin commands', () => {
+  let at = 1000, incoming = 100, sectors = 10, fail = false;
+  const commands = [];
+  const sampler = createHostSampler({ platform: 'linux', pid: 9999, now: () => at,
+    cpus: () => Array.from({ length: 8 }, () => ({ times: { user: at, nice: 0, sys: at, idle: at * 8, irq: 0 } })),
+    wholeDisk: name => name === 'nvme0n1', readdir: () => [],
+    readFile(file) {
+      if (fail) throw Error('source failed');
+      return ({ '/proc/net/dev': `eth0: ${incoming} 1 0 0 0 0 0 0 200 1 0 0 0 0 0 0`,
+        '/proc/net/route': 'eth0 00000000 0100000A 0003 0 0 100 00000000',
+        '/proc/diskstats': `259 0 nvme0n1 2 0 ${sectors} 0 3 0 20 0 0 0 0` })[file] || '';
+    }, run(file, args) { commands.push([file, args]); return proc(10, 1, 2, 100, '/opt/codex app-server') + '\n' + proc(11, 10, 3, 200, '/usr/bin/python3 /plugins/example_mcp.py --secret hidden'); } });
+  const first = sampler.sample();
+  assert.equal(first.network.interfaceName, 'eth0'); assert.equal(first.network.inRate, null);
+  assert.equal(first.disk.readRate, null); assert.equal(first.processes.counts.mcp, 1);
+  at = 3000; incoming = 500; sectors = 30;
+  const second = sampler.sample();
+  assert.equal(second.network.inRate, 200); assert.equal(second.disk.readRate, 5120);
+  assert.equal(second.cpu.usagePercent, 20); assert.equal(second.processes.cpuPercent, 5);
+  assert.ok(commands.every(([file]) => file === 'ps'));
+  assert.ok(!JSON.stringify(second).includes('hidden'));
+  at = 4000; fail = true; assert.equal(sampler.sample().network.inRate, null);
+  at = 5000; fail = false; assert.equal(sampler.sample().network.inRate, null);
+});
+
+const windowsFixture = () => ({
+  processes: [
+    { pid: 10, ppid: 1, executable: 'C:\\Program Files\\Codex\\codex.exe', command: '"C:\\Program Files\\Codex\\codex.exe" app-server', cpu100ns: '10000000', rssBytes: '1024', startedAt: 1000 },
+    { pid: 11, ppid: 10, executable: 'C:\\Python\\python.exe', command: 'C:\\Python\\python.exe C:\\plugins\\mcp_server.py --token private-token', cpu100ns: '10000000', rssBytes: '2048', startedAt: 1000 },
+    { pid: 12, ppid: 10, executable: 'C:\\Windows\\System32\\cmd.exe', command: 'cmd.exe /c job.exe', cpu100ns: '10000000', rssBytes: '1024', startedAt: 1000 },
+    { pid: 13, ppid: 12, executable: 'C:\\tools\\job.exe', command: 'C:\\tools\\job.exe', cpu100ns: '10000000', rssBytes: '4096', startedAt: 1000 },
+  ],
+  networks: [{ name: 'Ethernet', inBytes: '1000', outBytes: '2000' }, { name: 'Tunnel', inBytes: '999999', outBytes: '999999' }],
+  routes: [{ name: 'Ethernet', prefix: '0.0.0.0/0', metric: 0, interfaceMetric: 10 }],
+  disks: [{ id: '0 C:', readBytes: '1000', writeBytes: '2000', readOps: '10', writeOps: '20' }],
+  battery: { EstimatedChargeRemaining: 80, BatteryStatus: 6, EstimatedRunTime: 71582788 },
+  operatingSystem: { TotalVisibleMemorySize: '10000', FreePhysicalMemory: '6000' },
+  pagefiles: [{ AllocatedBaseSize: 1024, CurrentUsage: 10 }],
+});
+
+test('Windows host uses one bounded PowerShell snapshot and real multi-core process CPU deltas', () => {
+  let at = 2000, value = windowsFixture(), calls = 0;
+  const sampler = createHostSampler({ platform: 'win32', pid: 9999, now: () => at,
+    cpus: () => Array.from({ length: 8 }, () => ({ times: { user: at, nice: 0, sys: at, idle: at * 8, irq: 0 } })),
+    run(file, args) {
+      calls++; assert.equal(file, 'powershell.exe');
+      assert.ok(args.includes('-NoProfile') && args.includes('-NonInteractive'));
+      const script = Buffer.from(args.at(-1), 'base64').toString('utf16le');
+      assert.ok(script.includes('Win32_Process') && script.includes('Win32_PerfRawData_PerfDisk_PhysicalDisk'));
+      assert.ok(!script.includes('Set-') && !script.includes('ExecutionPolicy'));
+      return JSON.stringify(value);
+    } });
+  const first = sampler.sample();
+  assert.equal(first.processes.cpuPercent, null); assert.equal(first.processes.rssBytes, 7168);
+  assert.deepEqual(first.processes.items.map(item => item.pid).toSorted((a, b) => a - b), [10, 11, 13]);
+  assert.equal(first.processes.counts.mcp, 1);
+  assert.equal(first.network.interfaceName, 'Ethernet'); assert.equal(first.network.inRate, null);
+  assert.equal(first.power.state, 'charging'); assert.equal(first.power.remainingMinutes, null);
+  at = 3000; assert.equal(sampler.sample(), first); assert.equal(calls, 1);
+  at = 5000;
+  for (const item of value.processes) item.cpu100ns = '70000000';
+  value.networks[0].inBytes = '4000'; value.disks[0].readBytes = '7000';
+  const second = sampler.sample();
+  assert.equal(second.processes.cpuPercent, 600); assert.equal(second.network.inRate, 1000); assert.equal(second.disk.readRate, 2000);
+  assert.equal(second.systemSnapshot.operatingSystem.FreePhysicalMemory, '6000');
+  assert.ok(!JSON.stringify(second).includes('private-token') && !JSON.stringify(second).includes('command'));
+  at = 6000; const forced = sampler.sample({ force: true }); assert.equal(calls, 3); assert.equal(forced.processes.cpuPercent, 0);
+});
+
+test('Windows CPU resets, PID reuse, command failures and missing route metadata stay unknown', () => {
+  let at = 2000, value = windowsFixture(), fail = false;
+  const sampler = createHostSampler({ platform: 'win32', pid: 9999, now: () => at, windowsCacheMs: 0,
+    cpus: () => [], run() { if (fail) throw Error('unavailable'); return JSON.stringify(value); } });
+  sampler.sample(); at = 3000;
+  value.processes[0].cpu100ns = '1'; value.processes[1].startedAt = 2500;
+  value.routes = [];
+  const reset = sampler.sample();
+  assert.equal(reset.processes.cpuPercent, null); assert.equal(reset.network.interfaceName, null);
+  at = 4000; fail = true;
+  const missing = sampler.sample(); assert.equal(missing.processes.available, false); assert.equal(missing.systemSnapshot, null);
+  assert.equal(missing.disk.readRate, null); assert.equal(missing.network.inRate, null);
+  at = 5000; fail = false; value = windowsFixture(); assert.equal(sampler.sample().processes.cpuPercent, null);
+  at = 6000;
+  value.processes = [{ pid: 10, ppid: 1, name: 'Codex.exe', executable: null, command: null, cpu100ns: '10000000', rssBytes: '1024', startedAt: 1000 }];
+  const restricted = sampler.sample().processes;
+  assert.equal(restricted.available, true); assert.equal(restricted.roleCoverageComplete, false);
+  assert.equal(restricted.items[0].name, 'Codex.exe'); assert.equal(restricted.rssBytes, 1024);
 });

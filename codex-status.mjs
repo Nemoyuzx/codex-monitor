@@ -29,10 +29,12 @@ import { buildDashboardRegions, bytes as dashboardBytes } from './dashboard-mode
 import { parseOptions, getViewNames, reduceKey, createKeyDecoder } from './monitor-options.mjs';
 import { createTranslator, getLocale, setLocale, resolveLocale, formatAgo } from './i18n.mjs';
 import { statusMessages } from './locales/status.mjs';
+import { createCapabilityInventorySampler } from './capability-inventory.mjs';
+import { createPlatformSystemSampler } from './platform-system.mjs';
 
 const t = createTranslator(statusMessages);
 const shutdown = new AbortController();
-const topSampler = createTopSampler();
+const topSampler = createTopSampler({ cacheMs: process.platform === 'darwin' ? 2500 : 0 });
 
 let options;
 try { options = parseOptions(process.argv.slice(2)); setLocale(options.lang); }
@@ -82,6 +84,9 @@ function networkProbeKey(details) {
 
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const inventorySampler = createCapabilityInventorySampler({ home: CODEX_HOME, userHome: os.homedir(), cwd: process.cwd() });
+const platformSystemSampler = createPlatformSystemSampler({ cacheMs: 0 });
+let portableSystemSnapshot = null;
 let NOW = Date.now();
 const HOUR_MS = 3600000;
 const TEN_MIN_S = 600;
@@ -151,12 +156,6 @@ function cfgVal(key) {
   }
   return '';
 }
-function mcpServerCount() {
-  let n = 0;
-  for (const line of configText().split('\n')) if (line.startsWith('[mcp_servers.')) n++;
-  return n;
-}
-
 // ---- 格式化 ----
 const p2 = n => (n < 10 ? '0' + n : '' + n);
 function fmtTs(ms) {
@@ -244,6 +243,7 @@ let lastVm = null;
 function pushHist(key, v) { hist[key].push(v); if (hist[key].length > HIST_MAX) hist[key].shift(); }
 let SYSINFO = null;
 function sysStatic() {
+  if (process.platform !== 'darwin') return portableSystemSnapshot?.sys || { ncpu: null, mem: null, brand: '', bootSec: null };
   if (SYSINFO === null) {
     const p = sh('sysctl -n hw.ncpu hw.memsize machdep.cpu.brand_string kern.boottime').split('\n');
     SYSINFO = {
@@ -256,6 +256,7 @@ function sysStatic() {
   return SYSINFO;
 }
 function loadAvg() {
+  if (process.platform !== 'darwin') return portableSystemSnapshot?.load || [null, null, null];
   try {
     const values = os.loadavg();
     if (values.length >= 3 && values.slice(0, 3).every(Number.isFinite)) return values.slice(0, 3);
@@ -265,6 +266,7 @@ function loadAvg() {
 const fmtLoad = (value, digits = 1) => Number.isFinite(value) ? value.toFixed(digits) : '—';
 const fmtSampleRate = value => Number.isFinite(value) && value >= 0 ? fmtRate(value) : '—';
 function memUsedPct() {
+  if (process.platform !== 'darwin') return -1;
   const m = sh('memory_pressure -Q 2>/dev/null').match(/free percentage:\s*(\d+)%/);
   return m ? 100 - Number(m[1]) : -1;
 }
@@ -276,6 +278,7 @@ function fmtRate(n) {
   return String(Math.round(n));
 }
 function vmStat() {
+  if (process.platform !== 'darwin') return portableSystemSnapshot?.vm || {};
   const s = sh('vm_stat');
   const out = {};
   const ps = (s.match(/page size of (\d+)/) || [])[1];
@@ -287,6 +290,7 @@ function vmStat() {
   return out;
 }
 function parseSwap() {
+  if (process.platform !== 'darwin') return portableSystemSnapshot?.swap || { used: null, total: null };
   const m = sh('sysctl -n vm.swapusage').match(/total\s*=\s*([\d.]+)\s*([KMGTP]?)\s+used\s*=\s*([\d.]+)\s*([KMGTP]?)/i);
   const mult = { B: 1, K: 1024, M: 1048576, G: 1073741824, T: 1099511627776 };
   if (!m) return { used: null, total: null };
@@ -343,6 +347,7 @@ async function getProbes(force = false) {
 // 数据目录总占用（du 一次性，懒加载缓存）
 let codexSize = null;
 function codexDirSize() {
+  if (process.platform === 'win32') return -1;
   if (codexSize === null) {
     let output = '';
     try { output = execFileSync('du', ['-sk', CODEX_HOME], { encoding: 'utf8', timeout: 8000, stdio: ['ignore','pipe','ignore'] }); } catch {}
@@ -402,17 +407,25 @@ async function runOnce() {
   const model = cfgVal('model') || '?';
   const sandbox = cfgVal('sandbox_mode') || '?';
   const reas = cfgVal('model_reasoning_effort') || '?';
-  const mcpN = mcpServerCount();
+  const inventory = await inventorySampler.sample({ force: forceNetworkRefresh });
+  const installedCount = group => group?.available && Number.isFinite(group.total)
+    ? (inventory.coverage?.complete === false ? '≥' : '') + group.total : '—';
+  const mcpN = installedCount(inventory.mcp);
+  const skillN = installedCount(inventory.skills);
   let cliVer = '';
   if (ST) { const r = one(ST.db, "SELECT cli_version FROM threads WHERE cli_version<>'' ORDER BY updated_at_ms DESC LIMIT 1"); cliVer = r?.cli_version || ''; }
-  lines.push(t('environment', { label: dim(t('environmentLabel')), model: cyan(model), sandbox: yellow(sandbox), reasoning: reas || '?', mcp: mcpN, cli: cliVer ? ' · CLI ' + cliVer : '' }));
+  lines.push(t('environment', { label: dim(t('environmentLabel')), model: cyan(model), sandbox: yellow(sandbox), reasoning: reas || '?', mcp: mcpN, cli: cliVer ? ' · CLI ' + cliVer : '' }) + t('skillCount', { count: skillN }));
   lines.push(dim('\u2500'.repeat(twoCol ? leftW : 78)));
 
   const sampleStarted = Date.now();
   const forceThisSample = forceNetworkRefresh;
-  const topPromise = topSampler.sample({ force: forceThisSample, signal: shutdown.signal });
+  let topPromise = process.platform === 'darwin' ? topSampler.sample({ force: forceThisSample, signal: shutdown.signal }) : null;
   const legacyProbeTask = legacyProbeController.refresh(null, { force: forceThisSample });
-  const host = hostSampler.sample();
+  const host = hostSampler.sample({ force: forceThisSample });
+  if (process.platform !== 'darwin') {
+    portableSystemSnapshot = platformSystemSampler.sample({ path: CODEX_HOME, force: forceThisSample, windowsSnapshot: host.systemSnapshot });
+    topPromise = topSampler.sample({ force: forceThisSample, signal: shutdown.signal, systemSnapshot: portableSystemSnapshot, hostSnapshot: host });
+  }
   const networkDetailsPromise = networkDetailsSampler.sample({ interfaceName: host.network.interfaceName, force: forceNetworkRefresh });
   forceNetworkRefresh = false;
   const psCmd = host.processSnapshot;
@@ -445,7 +458,7 @@ async function runOnce() {
   pushHist('codexCpu', codexCpu);
   pushHist('activity', logRate);
   const vm = vmStat();
-  const pageSize = vm.pageSize || 16384;
+  const pageSize = vm.pageSize > 0 ? vm.pageSize : process.platform === 'darwin' ? 16384 : null;
   const faults = vm['Translation faults'];
   const pageins = vm['Pageins'];
   const pageouts = vm['Pageouts'];
@@ -472,19 +485,21 @@ async function runOnce() {
   const memPct = Number.isFinite(tm.memUsed) && sys.mem > 0 ? tm.memUsed / sys.mem * 100 : null;
   const toolRate = Number.isFinite(activity.tools.completed10m) ? activity.tools.completed10m / 600 : null;
   for (const [key, value] of Object.entries({ cpu: host.cpu.usagePercent, physicalMem: memPct, network: netRate >= 0 ? netRate * 1024 : null, networkIn: netInRate, networkOut: netOutRate, diskRead: host.disk.readRate, diskWrite: host.disk.writeRate, codexRss: host.processes.rssBytes, toolRate, swap: swap.used })) pushHist(key, value);
-  const anonBytes = Number.isFinite(vm['Anonymous pages']) ? vm['Anonymous pages'] * pageSize : null;
-  const cachedBytes = Number.isFinite(vm['File-backed pages']) && Number.isFinite(vm['Pages purgeable']) ? (vm['File-backed pages'] + vm['Pages purgeable']) * pageSize : null;
+  const anonBytes = Number.isFinite(vm.anonymousBytes) ? vm.anonymousBytes : pageSize && Number.isFinite(vm['Anonymous pages']) ? vm['Anonymous pages'] * pageSize : null;
+  const cachedBytes = Number.isFinite(vm.cachedBytes) ? vm.cachedBytes : pageSize && Number.isFinite(vm['File-backed pages']) && Number.isFinite(vm['Pages purgeable']) ? (vm['File-backed pages'] + vm['Pages purgeable']) * pageSize : null;
+  const compressedBytes = Number.isFinite(vm.compressedBytes) ? vm.compressedBytes : pageSize && Number.isFinite(compPages) ? compPages * pageSize : null;
+  const compressedOriginalBytes = Number.isFinite(vm.compressedOriginalBytes) ? vm.compressedOriginalBytes : pageSize && Number.isFinite(compStored) ? compStored * pageSize : null;
   const loadRatio = sys.ncpu && Number.isFinite(load[0]) ? (load[0] / sys.ncpu) * 100 : null;
   const loadCol = loadRatio == null ? dim : loadRatio < 60 ? green : (loadRatio < 100 ? yellow : red);
   const memCol = memPct == null ? dim : memPct < 80 ? green : (memPct < 95 ? yellow : red);
   const tp = procs.slice(0, 3);
   lines.push('');
-  lines.push(magenta(bold(t('hostTitle'))) + '  ' + dim(t('hostSummary', { brand: sys.brand || '?', cores: sys.ncpu || '?', memory: fmtBytes(sys.mem), uptime: fmtUptime(Math.floor(NOW / 1000) - sys.bootSec) })));
+  lines.push(magenta(bold(t('hostTitle'))) + '  ' + dim(t('hostSummary', { brand: sys.brand || '?', cores: sys.ncpu || '?', memory: fmtBytes(sys.mem), uptime: fmtUptime(sys.bootSec > 0 ? Math.floor(NOW / 1000) - sys.bootSec : null) })));
   lines.push(t('hostLoad', { current: loadCol(bold('1m ' + fmtLoad(load[0]))), averages: dim(' · 5m ' + fmtLoad(load[1]) + ' · 15m ' + fmtLoad(load[2])), cores: sys.ncpu || '?' }));
   if (Number.isFinite(memPct)) lines.push(t('hostMemory', { percent: memCol(bold(memPct.toFixed(1)) + '%'), detail: dim(t('physicalUsed', { used: fmtBytes(tm.memUsed), total: fmtBytes(sys.mem) })) }));
   lines.push(t('hostCpu', { cpu: Number.isFinite(host.cpu.usagePercent) ? bold(host.cpu.usagePercent.toFixed(1) + '%') : '—', codex: Number.isFinite(codexCpu) ? t('multiCorePercent', { percent: codexCpu.toFixed(1) }) : '—', rss: dashboardBytes(host.processes.rssBytes) }));
   lines.push(t('hostNetwork', { rate: netRate >= 0 ? cyan(fmtBytes(Math.round(netRate * 1024)) + '/s') : dim('—') }));
-  if (tp.length) lines.push(t('hostTopCpu', { processes: tp.map(p => (p.cpu > 50 ? red : cyan)(clip(p.name, 18) + ' ' + p.cpu.toFixed(0) + '%')).join(' · ') }));
+  if (tp.length) lines.push(t('hostTopCpu', { processes: tp.map(p => (p.cpu > 50 ? red : cyan)(clip(p.name, 18) + ' ' + (Number.isFinite(p.cpu) ? p.cpu.toFixed(0) + '%' : '—'))).join(' · ') }));
   lines.push('');
   lines.push(yellow(bold(t('activityMonitor'))) + dim('  top -l 1'));
   if (tm.cpuUser != null) lines.push(t('cpuBreakdown', { user: bold(tm.cpuUser.toFixed(1)), system: bold(tm.cpuSys.toFixed(1)), idle: tm.cpuIdle.toFixed(1) }));
@@ -579,6 +594,7 @@ async function runOnce() {
 
   // [3] 进程 · MCP · 队列 · 目标（复用上面一次采集的 psCmd）
   const appServerProc = host.processes.counts['app-server'] || 0;
+  const appAlive = host.processes.available && host.processes.items.some(item => ['app-server', 'cli', 'desktop'].includes(item.role));
   const execServerProc = host.processes.counts['exec-server'] || 0;
   const codeModeHostProc = host.processes.counts['code-mode'] || 0;
   const netServiceProc = (psCmd.match(/network\.mojom\.NetworkService/g) || []).length;
@@ -639,12 +655,16 @@ async function runOnce() {
   const errRecent = activity.alerts.error10m;
   const warnRecent = activity.alerts.warn10m;
   let dfAvail = '', dfCap = '';
-  {
+  if (process.platform === 'darwin') {
     let output = '';
     try { output = execFileSync('df', ['-h', CODEX_HOME], { encoding: 'utf8', timeout: 2000, stdio: ['ignore','pipe','ignore'] }); } catch {}
     const p = output.trim().split('\n').at(-1).trim().split(/\s+/);
     dfAvail = p[3] || '';
     dfCap = p[4] || '';
+  } else {
+    const disk = portableSystemSnapshot?.disk;
+    dfAvail = Number.isFinite(disk?.availableBytes) ? dashboardBytes(disk.availableBytes) : '';
+    dfCap = Number.isFinite(disk?.usedPercent) ? disk.usedPercent.toFixed(1) + '%' : '—';
   }
   beginDiagnosticSection('storageTitle');
   diagnosticMessage('tokenTotal', { count: bold(tokenSum == null ? '—' : human(tokenSum)), model: topModel ? t('tokenModel', { model: cyan(topModel) }) : '' });
@@ -658,7 +678,7 @@ async function runOnce() {
     diagnosticMessage('contextWindow', { window: win ? human(win) : '?', threshold: auto ? t('compactionThreshold', { count: human(auto) }) : '', recent: comps > 0 ? t('recentCompactions', { count: comps }) : t('noRecentCompactions') });
   }
   diagnosticMessage('pageFaults', { faults: bold(fmtSampleRate(faultRate)), input: fmtSampleRate(pageinRate), output: fmtSampleRate(pageoutRate) });
-  diagnosticMessage('compressedMemory', { compressed: fmtBytes(compPages * pageSize), original: fmtBytes(compStored * pageSize), swap: swapBytes == null ? '—' : swapBytes > 0 ? yellow(fmtBytes(swapBytes)) : '0' });
+  diagnosticMessage('compressedMemory', { compressed: fmtBytes(compressedBytes), original: fmtBytes(compressedOriginalBytes), swap: swapBytes == null ? '—' : swapBytes > 0 ? yellow(fmtBytes(swapBytes)) : '0' });
   if (codexDirSize() > 0) diagnosticMessage('dataDirectory', { size: bold(fmtBytes(codexDirSize())), db: fmtBytes(dbTotal) });
   else diagnosticMessage('dbFiles', { size: fmtBytes(dbTotal) });
   if (topDb) diagnosticMessage('largestDb', { file: topDb.f, size: bold(fmtBytes(topDb.s)) });
@@ -673,14 +693,14 @@ async function runOnce() {
   // [6] 保守判断
   let verdict;
   const facts = [];
-  if (!host.processes.available) facts.push(dim(t('processUnavailable'))); else if (appServerProc > 0) facts.push(green(t('appAlive'))); else facts.push(red(t('appServerMissing')));
+  if (!host.processes.available || host.processes.roleCoverageComplete === false) facts.push(dim(t('processUnavailable'))); else if (appAlive) facts.push(green(t('appAlive'))); else facts.push(red(t('appProcessMissing')));
   facts.push(dim(t('identifiableMcp', { count: mcpTotal ?? '—' })));
   if (queuedItems == null) facts.push(dim(t('queueUnknown'))); else if (queuedItems > 0) facts.push(yellow(t('queueBacklog', { count: queuedItems }))); else facts.push(green(t('queueEmpty')));
   if (netOk) facts.push(green(t('httpReachable'))); else if (probeRes.length) facts.push(red(t('networkFailed'))); else if (options.noProbes) facts.push(dim(t('httpDisabled')));
   if (errRecent == null) facts.push(dim(t('alertsUnknown'))); else if (errRecent > 0) facts.push(yellow('ERROR=' + errRecent)); else facts.push(green(t('noRecentErrors')));
 
-  if (!host.processes.available || !activity.availability.history || !activity.availability.state || !Number.isFinite(activity.turns.recentRunning)) verdict = 'verdictIncomplete';
-  else if (appServerProc === 0) verdict = 'verdictExited';
+  if (!host.processes.available || host.processes.roleCoverageComplete === false || !activity.availability.history || !activity.availability.state || !Number.isFinite(activity.turns.recentRunning)) verdict = 'verdictIncomplete';
+  else if (!appAlive) verdict = 'verdictExited';
   else if (!netOk && probeRes.length) verdict = 'verdictNetwork';
   else if (hungTools.length > 0) verdict = 'verdictHung';
   else if (activity.turns.recentRunning > 0 && sleepLoopCount >= 3) verdict = 'verdictPolling';
@@ -698,14 +718,14 @@ async function runOnce() {
 
   lines.splice(4, 0, t('statusLabel') + paintVerdict(verdict), dim(t('taskStatus', { running: activity.turns.recentRunning ?? '—', tools: activity.tools.pending ?? '—', queue: activity.queue.count ?? '—', errors: activity.alerts.error10m ?? '—' })));
   const sampleMs = Date.now() - sampleStarted;
-  const dashboard = { host, activity, performance: performanceCache, sys, tm, load, pressurePercent: pressurePct, swap, hist, now: NOW,
+  const dashboard = { host, activity, inventory, performance: performanceCache, sys, tm, load, pressurePercent: pressurePct, swap, hist, now: NOW,
     probes: probeRes, storage: { dbBytes: dbTotal, walBytes: inv.filter(item => item.f.endsWith('-wal')).reduce((sum, item) => sum + item.s, 0), diskAvailable: dfAvail },
     networkDetails, networkProbes, legacyProbeState, sampleMs, intervalMs: interval * 1000, noProbes: options.noProbes, limit: options.threads };
   lastRender = { lines, dashboard, diagnosticSections };
-  lastSnapshot = { at: NOW, host, activity, performance: performanceCache, networkDetails, networkProbes, storage: dashboard.storage, probes: probeRes,
+  lastSnapshot = { at: NOW, host, activity, inventory, performance: performanceCache, networkDetails, networkProbes, storage: dashboard.storage, probes: probeRes,
     system: { ...sys, load, physicalMemoryUsedBytes: tm.memUsed ?? null, physicalMemoryPercent: memPct,
       memoryPressureEstimatePercent: pressurePct >= 0 ? pressurePct : null, swap,
-      vm: { faultRate, pageinRate, pageoutRate, compressedBytes: Number.isFinite(compPages) ? compPages * pageSize : null } },
+      vm: { faultRate, pageinRate, pageoutRate, compressedBytes } },
     environment: { model, reasoning: reas, sandbox, cliVersion: cliVer },
     monitor: { pid: process.pid, rssBytes: process.memoryUsage().rss },
     sampleMs, intervalSeconds: interval, windowSeconds: uiState.windowSeconds };
@@ -722,11 +742,15 @@ function renderLast() {
   const original = lastRender.lines;
   const index = marker => original.findIndex(line => line.includes(marker));
   const header = original.slice(0, 6);
+  const informationWidth = layout.columns === 2 ? layout.primary : layout.left;
+  const dedicatedPage = ['extensions', 'running'].includes(uiState.view);
   let primary;
   if (uiState.view === 'host') primary = original.slice(6, index('[1]'));
   else if (uiState.view === 'tasks') primary = original.slice(index('[1]'), index('[3]'));
   else if (uiState.view === 'diagnostics') primary = renderInformationSections(lastRender.diagnosticSections,
-    { width: layout.columns === 2 ? layout.primary : layout.left, color: COLOR });
+    { width: informationWidth, color: COLOR });
+  else if (dedicatedPage) primary = renderInformationSections(information.filter(section => section.pane === 'primary'),
+    { width: informationWidth, color: COLOR });
   else {
     primary = original.slice(6, index('[4]'));
     const storageLabels = ['localIpc', 'dataDirectory', 'dbFiles', 'largestDb', 'walBacklog', 'largestWal', 'diskFree', 'compressedMemory', 'contextWindow'].map(key => t(key).split('{')[0]);
@@ -736,7 +760,8 @@ function renderLast() {
   if (!layout.right) information.unshift({ title: t('resourceValuesTitle'), tag: 'VALUES', tone: 'cyan',
     rows: charts.sections.flatMap(section => section.metrics.map(metric => ({ label: metric.label, value: metric.value, tone: metric.tone }))) });
   if (!layout.right) information.push(systemStatus);
-  let secondary = renderInformationSections(information, { width: layout.columns === 2 ? layout.secondary : layout.left, color: COLOR });
+  let secondary = renderInformationSections(dedicatedPage ? information.filter(section => section.pane !== 'primary') : information,
+    { width: layout.columns === 2 ? layout.secondary : layout.left, color: COLOR });
   let pinned = header;
   if (uiState.showHelp) {
     pinned = [];
@@ -803,6 +828,7 @@ function closeDatabases() {
   shutdown.abort();
   networkProbeController.close(); legacyProbeController.close();
   sourceRegistry.close();
+  inventorySampler.close();
 }
 
 if (watch) {

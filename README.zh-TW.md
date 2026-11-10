@@ -2,7 +2,7 @@
 
 [简体中文](README.md) · [繁體中文](README.zh-TW.md) · [English](README.en.md) · [日本語](README.ja.md)
 
-適用於 macOS 的唯讀本機 Codex 終端監控台：即時主機資源圖表、聊天與工具活動、程序資訊、網路設定，以及實際的 HTTPS 代理出口檢測。執行時不依賴第三方 npm 套件。本專案由社群獨立開發，與 OpenAI 無官方隸屬關係。
+適用於 macOS、Linux 與 Windows 的唯讀本機 Codex 終端監控台：即時主機資源圖表、聊天與工具活動、MCP／Skill 安裝清單、執行中任務樹，以及實際的 HTTPS 代理出口檢測。執行時不依賴第三方 npm 套件。本專案由社群獨立開發，與 OpenAI 無官方隸屬關係。
 
 ![使用合成 DEMO 資料、敏感欄位已遮蔽的介面預覽](docs/preview-zh-TW.svg)
 
@@ -10,7 +10,17 @@
 
 ## 安裝與啟動
 
-需要 **Node.js 24+**、**macOS** 與 **curl 8.7+**。完整主機採樣依賴系統內建的 `sysctl`、`top`、`vm_stat`、`memory_pressure`、`route`、`scutil`、`ioreg`、`pmset` 等工具。其他作業系統可能能取得部分基本指標，完整支援尚未驗證。
+需要 **Node.js 24+** 與 **curl 8.7+**，提供 macOS、Linux、Windows 採集後端。工具、提供者或權限不足時，受影響的指標保留未知，不以零或健康狀態取代。透過 GitHub URL 安裝或複製儲存庫還需要 Git。
+
+| 平台 | 來源與相依工具 | 說明 |
+| --- | --- | --- |
+| macOS | 內建的 `sysctl`、`top`、`vm_stat`、`memory_pressure`、`route`、`scutil`、`ioreg`、`pmset` 等 | 保留既有主機與代理採集 |
+| Linux | `/proc`、`/sys`、`ps`；可用時以 `ip` 查詢路由 | 不依賴 macOS 工具；沒有可靠的系統代理來源時顯示未知 |
+| Windows | Windows PowerShell 5.1、CIM、`curl.exe` | 從目前使用者的 Internet Settings 讀取代理；提供者或權限限制可能使部分指標無法取得 |
+
+Windows 沒有 Unix load average，也不會將無法可靠取得的缺頁或系統壓力等數值當作可用。
+
+實際驗證已涵蓋 macOS 上的 Node.js 24/26，以及 Linux arm64 Docker 容器（官方 `node:24-trixie-slim`、Node.js 24.22.2、curl 8.14.1）內的測試與語法檢查；Linux 容器僅略過 Darwin `top` 專用測試，不等於已在原生 Linux 主機驗證。Windows 的解析與指令 fixture 測試已通過，尚未在原生 Windows 實機驗證。各平台的原生 CI 結果應查看對應的 [GitHub Actions](https://github.com/Nemoyuzx/codex-monitor/actions) 作業。
 
 從 GitHub 安裝指令：
 
@@ -28,17 +38,28 @@ npm link --ignore-scripts
 codex-monitor
 ```
 
+在 Windows PowerShell 中，若執行原則阻擋 `.ps1` 包裝檔，可使用 npm 產生的 `.cmd` 入口：
+
+```powershell
+npm.cmd install --global git+https://github.com/Nemoyuzx/codex-monitor.git
+codex-monitor.cmd
+```
+
+Windows 複製儲存庫後以 `npm.cmd link --ignore-scripts` 建立連結；也可直接執行 `node codex-status.mjs -w`，不必變更 PowerShell 執行原則。
+
 安裝後可在任意目錄直接輸入 `codex-monitor`，預設進入每秒更新的互動模式，不必每次切換到專案目錄。
 
 ```sh
 codex-monitor -i 3                  # 每 3 秒更新
 codex-monitor --view diagnostics    # 開啟診斷頁
+codex-monitor --view extensions     # MCP / Skill 安裝清單
+codex-monitor --view running        # 執行中任務與子代理
 codex-monitor --once                # 單次文字輸出
 codex-monitor --json --no-probes    # 單次 JSON，不連線至外部探測服務
 codex-monitor -w --json              # 持續輸出 JSONL
 ```
 
-開發測試另需 `openssl` 與監聽本機回送連接埠的權限。所有測試均使用暫存檔、記憶體資料庫或本機服務，不需要 Codex 帳號，也不依賴網際網路。Node.js 24/26 的自動測試設定見 [GitHub Actions](https://github.com/Nemoyuzx/codex-monitor/actions)。
+開發測試另需 `openssl` 與監聽本機回送連接埠的權限。所有測試均使用暫存檔、記憶體資料庫或本機服務，不需要 Codex 帳號，也不依賴網際網路。macOS／Linux／Windows 與 Node.js 24/26 的 CI 矩陣設定見 [GitHub Actions](https://github.com/Nemoyuzx/codex-monitor/actions)。
 
 目前沒有獨立桌面應用程式；指令需要終端與 Node.js 執行環境。SQLite 資料結構屬於 Codex 內部實作，後續版本可能變更，無法讀取的欄位會顯示為未知。
 
@@ -69,18 +90,18 @@ node codex-status.mjs --color              # 強制彩色（使用管線時也�
 node codex-status.mjs --no-color           # 關閉顏色
 node codex-status.mjs -w --view tasks      # 從任務頁啟動
 node codex-status.mjs -w --window 300      # 最近 5 分鐘的趨勢
-node codex-status.mjs -w --interface en0   # 固定網路介面
+node codex-status.mjs -w --interface en0   # 固定網路介面（macOS 範例）
 node codex-status.mjs --json --no-probes  # JSON 快照，關閉所有外部探測
 node codex-status.mjs -w --json            # 持續輸出 JSONL
 ```
 
-即時模式參考 nvitop 的終端配置，提供總覽、主機、任務與診斷四頁。右側顯示 8 張主機／Codex 趨勢圖，以及各核心 CPU、電源與系統壓力；任務、程序、工具、網路設定、警示與效能詳情位於左側。終端寬度達 180 欄時，左側自動分成兩欄，標頭固定，兩欄內文同步捲動。寬螢幕右欄約占 40%，其餘寬度留給左側資訊。
+即時模式參考 nvitop 的終端配置，提供總覽、主機、任務、診斷、擴充清單與執行中任務六頁。右側顯示 8 張主機／Codex 趨勢圖，以及各核心 CPU、電源與系統壓力；任務、程序、工具、網路設定、警示與效能詳情位於左側。終端寬度達 180 欄時，左側自動分成兩欄，標頭固定，兩欄內文同步捲動。寬螢幕右欄約占 40%，其餘寬度留給左側資訊。
 
 - 圖表填滿可用寬度，最新採樣位於最右側；缺失或尚未採集的資料留空。
 - 圖表依可用高度放大，不會為文字清單壓縮；右側會保留各核心狀態的空間。較矮的視窗優先省略輔助文字，再縮小圖表高度。
 - 預設時間範圍為最近 80 秒；`-i 3` 時為最近 4 分鐘，橫軸依實際採樣時間繪製。
-- 實體記憶體採固定 0–100% 刻度，與 `memory_pressure` 的估計明確區分；整機及各核心 CPU 使用累計時間差值，Codex CPU 則為 `ps %CPU`（單核心 100%）。
-- 預設網路介面跟隨系統預設路由，分別顯示上傳與下載。區塊裝置 I/O 包含已掛載的磁碟映像檔，不代表僅統計實體硬碟。
+- 實體記憶體採固定 0–100% 刻度，並與系統壓力估計區分；整機及各核心 CPU 使用累計時間差值。Codex CPU 在 macOS／Linux 使用 `ps %CPU`，Windows 使用程序累計 CPU 時間差值；單核心滿載均為 100%，Windows 首次採樣沒有差值時顯示未知。
+- 預設網路介面跟隨系統預設路由，分別顯示上傳與下載。儲存 I/O 依各平台可確認的裝置來源統計；macOS 可能包含已掛載的磁碟映像檔，不代表僅統計實體硬碟。
 - 終端寬度不足 180 欄時，左側合併為單欄；不足 84 欄時隱藏右側圖表，8 項資源目前值仍可在文字詳情中查看。即時模式會為底部提示保留空間。
 - `--window` 支援 10–3600 秒，`--threads` 支援 1–30 筆表格項目。表格筆數上限不會將背景統計限制在目前顯示的聊天。
 
@@ -89,6 +110,7 @@ node codex-status.mjs -w --json            # 持續輸出 JSONL
 | 按鍵 | 操作 |
 | --- | --- |
 | `1` / `2` / `3` / `4` | 總覽／主機／任務／診斷 |
+| `5` / `6` | MCP 與 Skill 安裝清單／執行中任務與子代理 |
 | 空白鍵 / `p` | 暫停或恢復採樣；暫停期間保留目前畫面 |
 | `↑` / `↓`、`k` / `j` | 捲動左側完整內容，寬螢幕兩欄同步捲動 |
 | `PgUp` / `PgDn`、`g` / `Home` | 向上／向下翻頁、回到頂端 |
@@ -103,6 +125,13 @@ node codex-status.mjs -w --json            # 持續輸出 JSONL
 CODEX_HOME=/path/to/.codex node codex-status.mjs -w
 ```
 
+Windows PowerShell 可這樣設定資料目錄：
+
+```powershell
+$env:CODEX_HOME = Join-Path $HOME ".codex"
+codex-monitor.cmd --view extensions
+```
+
 ## 監控項目
 
 - **[1] 最近一次可見事件：**類型、內容、時間與距今時間，並附上最近的代理與使用者訊息。
@@ -115,13 +144,22 @@ CODEX_HOME=/path/to/.codex node codex-status.mjs -w
 右側趨勢圖與左側詳情包含：
 
 - **主機：**整機與各核心 CPU、實體記憶體、記憶體壓力估計、所選介面的分方向流量、區塊裝置讀寫與 IOPS、分頁錯誤、swap、電池與系統壓力；圖表可顯示時間範圍內的最小／最大／平均值。
-- **Codex：**依程序樹彙整 CPU／RSS，辨識桌面端、app-server、exec-server、code-mode、可辨識的 MCP 與工作程序，並顯示 CPU 排名。程序的指令參數中出現「codex」，不代表它就是 Codex 工作程序。RSS 加總會重複計入共用記憶體分頁。
+- **Codex：**依程序樹彙整 CPU／RSS，辨識桌面端、app-server、exec-server、code-mode、可辨識的 MCP 與工作程序，並顯示 CPU 排名。程序的指令參數中出現「codex」，不代表它就是 Codex 工作程序。Windows 的 RSS 欄使用 WorkingSetSize；程序記憶體加總會重複計入共用記憶體分頁。
 - **任務：**主要聊天／子代理、模型、執行時間、最近活動、歷史遺留回合、佇列數與最長等待時間，以及實際處於 active 狀態的目標數。
 - **工具：**近 10 分鐘／1 小時的完成與失敗數、工具類型、執行中項目，以及 P50／P95 耗時。完成速率依實際完成時間歸入統計範圍，顯示 10 分鐘平均值；失敗也計入總完成量。
 - **診斷：**HTTP 狀態與回應標頭延遲、ERROR／WARN 每分鐘平均值、logger target 摘要、DB／WAL 大小、磁碟剩餘空間、採集耗時與來源可用性。HTTP 401／403 等回應僅能證明連線路徑可達，不代表登入有效或服務可用；MCP 數量本身也不視為資源洩漏的證據。
 - **網路設定：**所選介面的本機 IPv4／IPv6、IPv4／IPv6 預設閘道、系統 DNS、HTTP／HTTPS／SOCKS 代理、PAC、自動探索與略過規則、目前程序的代理環境變數，以及偵測到的通道介面。總覽顯示摘要，診斷頁顯示完整詳情；存在通道介面不代表 VPN 已接管流量。
 - **出口實測：**直連與各條明確指定代理的公網 IP、實際 HTTPS 連通性、HTTP 狀態與請求耗時。認證失敗、TCP／DNS／代理交握／TLS／逾時等情況分開顯示；僅部分目標可達時會明確標示。按 `4` 可查看各階段耗時與路徑驗證詳情。
 - **Token：**資料庫累計計數及本次監控期間的計數增量，兩者都不代表模型生成速度。
+
+## 安裝清單與執行中任務
+
+- 總覽顯示已發現的 Skill 數量，區分安裝項目、啟用狀態及未知狀態。按 `5` 或使用 `--view extensions`，可查看 MCP 名稱、設定類型／來源，以及 Skill 名稱、描述、來源及本機路徑。已設定 MCP 不等於正在執行的 MCP 子程序；已安裝 Skill 也不表示目前聊天已載入。清單反映本機可讀設定；專案設定需要信任證據，不能據此斷言目前聊天最終生效的完整集合。
+- Skill 探索為本機、有界的唯讀掃描，依 `SKILL.md` 真實路徑去重，同名但路徑不同的安裝會分別保留；清單不含 Skill 內文。掃描範圍：包含目前目錄到儲存庫根目錄的 `.agents/skills`、使用者 `~/.agents/skills`、非 Windows 系統存在時的 `/etc/codex/skills`，以及相容的 `$CODEX_HOME/skills`（含 `.system`）。插件技能須有明確設定或安裝標記；殘留快取目錄不視為安裝證據。`[[skills.config]]` 的停用規則優先，證據不足時啟用狀態顯示未知。
+- MCP 清單來自 `$CODEX_HOME/config.toml`、有明確信任證據的專案 `.codex/config.toml`，以及啟用狀態明確的插件清單；只輸出名稱、類型、來源及啟用狀態，不輸出 URL、指令參數、環境變數值或認證標頭。清單快取 15 秒，涵蓋不完整時會提示，`r` 可強制更新。
+- 按 `6` 或使用 `--view running`，可查看近期 `inProgress` 主任務與子代理、父子關係、執行時間、模型、最近活動及未完成工具。陳舊記錄另計數，不列入目前執行中的清單；父記錄缺失或關係不完整時會明確說明，不會編造層級。
+- 執行中頁不受 `--threads` 顯示筆數截斷，但仍受背景有界採樣限制，涵蓋不完整時會提示。這是本機投影快照，不是伺服器端的完整即時任務來源。`r` 會更新安裝清單與採樣結果。
+- 新頁使用自適應列：兩組項目與內容都能完整容納時均分並排，較長內容使用整列。清單可捲動查看，不為了並排而截斷位址、任務名稱或說明。
 
 ## 選用的原生效能快照
 
@@ -149,11 +187,11 @@ CODEX_HOME=/path/to/.codex node codex-status.mjs -w
 - 4 個應用 HTTP 探測在背景執行，結果快取 10 秒；公網與代理 HTTPS 實測快取 60 秒，每秒更新畫面不會每次都重發請求。
 - 網路設定快取 10 秒，可按 `r` 強制更新。設定採樣保留本機代理連接埠的 TCP 監聽狀態，實際代理可用性由獨立 HTTPS 實測判定；系統設定、監聽狀態或獨立探測，不等同於 Codex 應用程式本身的請求路徑。
 - 代理環境變數與 PAC 位址僅顯示協定、主機與連接埠，不顯示認證資訊、路徑或查詢參數。`NO_PROXY` 僅顯示略過規則數量。
-- 資料目錄大小（`du`）僅採集一次；每次採樣共用一次完整的 `ps` 程序採集。
+- 目錄大小、程序及系統查詢依平台執行並重用採樣結果；缺少工具或權限不足時保留未知。
 - 每 5 秒重新檢查資料庫來源，啟動後新建的資料庫、版本輪替與檔案替換可自動接入；按 `r` 會立即重新探索來源並讀取設定。連線始終唯讀，來源不可用時保持空值。
 - 活動統計在單次採樣內重用預備 SQL 陳述式；資料表結構變更會使欄位快取失效。近期回合查詢可利用來源資料庫既有的時間索引，不會在來源資料庫建立索引。
 - 預設網路介面透過獨立的 1 秒快取跟隨路由；無法確認預設出口時保持未知，不依累計流量猜測。探測執行期間的更新要求會合併成一次後續請求。
-- 結束時會取消尚未完成的 `top` 採樣；缺失、重設或來源變更的速率基準不會被當作零速率。任務名稱中的複合 emoji 會以完整字元截斷及換行。
+- 結束時會取消尚未完成的系統採樣；缺失、重設或來源變更的速率基準不會被當作零速率。任務名稱中的複合 emoji 會以完整字元截斷及換行。
 - 時間戳記依各自單位換算：`threads.updated_at_ms`／`thread_items.*_at_ms` 為毫秒，`thread_turns.started_at`／`logs.ts` 為秒。
 - 工具統計涵蓋近一小時內更新的聊天與所有候選進行中回合，最多 256 個聊天、每個聊天 10000 筆投影資料；耗時百分位採用最多 2000 個具有實際耗時的已採樣完成項目。查詢結果至少快取 5 秒，達到上限會顯示「有界採樣」與 `≥`，不能據此聲稱所有工具均無異常。
 - SQL 查詢失敗或資料來源缺失時，會顯示不可用與空值，不將讀取失敗當作零占用、零警示或健康。歷史未完成項目會獨立列出，不能僅憑「超過 1 小時」斷言已停止。
@@ -169,7 +207,7 @@ npm test
 
 ## 隱私與分享
 
-終端頁面可能顯示本機聊天片段；JSON 雖省略訊息與指令內文，仍包含聊天標題／暱稱、UUID、模型、IP 位址及代理端點等中繼資料。分享截圖或匯出檔案前，請先檢查並遮蔽敏感資訊。請勿提交實際 Codex 資料庫、認證檔案、私人聊天截圖或網路封包擷取檔。
+終端頁面可能顯示本機聊天片段；JSON 雖省略訊息與指令內文，仍包含聊天標題／暱稱、UUID、模型、IP 位址、代理端點，以及 MCP／Skill 名稱與本機來源路徑等中繼資料。分享截圖或匯出檔案前，請先檢查並遮蔽敏感資訊。請勿提交實際 Codex 資料庫、認證檔案、私人聊天截圖或網路封包擷取檔。
 
 ## 貢獻與授權
 

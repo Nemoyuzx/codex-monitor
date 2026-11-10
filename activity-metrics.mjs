@@ -132,6 +132,7 @@ export function collectActivity({ historyDb = null, stateDb = null, logsDb = nul
     coverage: { complete: turnsAvailable, recentToolsComplete: turnsAvailable, pendingComplete: turnsAvailable, turnsAvailable, threads: 0, maxThreads: MAX_THREADS, maxItemsPerThread: MAX_ITEMS_PER_THREAD, cappedThreads: 0, pendingScope: 'recent-or-running-threads', durationSampleLimit: MAX_DURATION_SAMPLES },
     sessions: { total: null, main: null, agents: null, archived: null, recentHour: null, rows: [] },
     turns: { recentRunning: null, staleRunning: null, totalRunning: null },
+    runtime: { sampledAt: now, available: false, complete: false, running: null, main: null, agents: null, stale: null, rows: [] },
     tools: { window10m: blankWindow(), window1h: blankWindow(), byType: [], pending: null, stalePending: null, pendingRows: [], oldestPendingMs: null, completed10m: null, success10m: null, failed10m: null, durationSampleCount: 0, p50Ms: null, p95Ms: null },
     tokens: { total: null, unarchived: null, totalThreads: null, monitorDelta: null, monitorSince: null, resetDetected: false },
     alerts: { error10m: null, warn10m: null, errorPerMinute: null, warnPerMinute: null, recent: [] },
@@ -140,6 +141,7 @@ export function collectActivity({ historyDb = null, stateDb = null, logsDb = nul
   };
   const candidates = new Map();
   const runningByThread = new Map();
+  let runtimeScanComplete = turnsAvailable;
   let recentRunning = 0, staleRunning = 0;
   const threadCols = columns(stateDb, 'threads');
   const updatedExpr = timestampExpr(threadCols, 'updated_at_ms', 'updated_at');
@@ -167,15 +169,17 @@ export function collectActivity({ historyDb = null, stateDb = null, logsDb = nul
     const turnCounts = get(historyDb, `SELECT COUNT(*) AS total FROM thread_turns WHERE status='inProgress'`);
     result.turns.totalRunning = value(turnCounts, 'total');
     const turnRows = query(historyDb, `SELECT thread_id, turn_id, status, started_at FROM thread_turns WHERE status='inProgress' ORDER BY started_at DESC LIMIT ?`, MAX_THREADS + 1);
+    if (turnRows.length > MAX_THREADS) runtimeScanComplete = false;
     if (turnRows.length > MAX_THREADS) Object.assign(result.coverage, { complete: false, recentToolsComplete: false, pendingComplete: false });
     for (const row of turnRows.slice(0, MAX_THREADS)) {
       const previous = runningByThread.get(row.thread_id);
       const start = ms(row.started_at);
       const latest = availability.history ? get(historyDb, 'SELECT created_at_ms,completed_at_ms FROM thread_items WHERE thread_id=? AND turn_id=? ORDER BY rollout_ordinal DESC LIMIT 1', row.thread_id, row.turn_id) : null;
       const turnActivityAt = latest ? Math.max(Number(latest.created_at_ms) || 0, Number(latest.completed_at_ms) || 0) : null;
+      const observedActivity = latest ? [latest.created_at_ms, latest.completed_at_ms].map(Number).filter(at => Number.isFinite(at) && at > 0 && at <= now) : [];
       const stale = (start == null || start < cutoff) && (turnActivityAt == null || turnActivityAt < cutoff);
       stale ? staleRunning++ : recentRunning++;
-      if (!previous || (previous.stale && !stale) || (previous.stale === stale && start > previous.startedAt)) runningByThread.set(row.thread_id, { ...row, startedAt: start, stale });
+      if (!previous || (previous.stale && !stale) || (previous.stale === stale && start > previous.startedAt)) runningByThread.set(row.thread_id, { ...row, startedAt: start, stale, activityAt: observedActivity.length ? Math.max(...observedActivity) : null });
       if (!candidates.has(row.thread_id)) {
         const state = availability.state ? get(stateDb, `SELECT ${threadFields} FROM threads WHERE id=?`, row.thread_id) : null;
         candidates.set(row.thread_id, state || { id: row.thread_id });
@@ -280,6 +284,57 @@ export function collectActivity({ historyDb = null, stateDb = null, logsDb = nul
   result.tools.p95Ms = quantile(durations, 0.95);
   result.sessions.rows = sessionRows.sort((a, b) => (a.status === 'inProgress' ? 0 : a.stale ? 2 : 1) - (b.status === 'inProgress' ? 0 : b.stale ? 2 : 1) || (b.lastActivityAt || 0) - (a.lastActivityAt || 0)).slice(0, limit);
 
+  if (availability.history && availability.state && turnsAvailable) {
+    const parentRecords = new Map();
+    const runningRows = sessionRows.filter(row => {
+      const turn = runningByThread.get(row.id);
+      if (!turn || turn.stale) return false;
+      const observed = [turn.startedAt, turn.activityAt].some(at => at != null && at >= cutoff && at <= now);
+      if (!observed) runtimeScanComplete = false;
+      return observed;
+    });
+    const runningIds = new Set(runningRows.map(row => row.id));
+    const rows = runningRows.map(row => {
+      const turn = runningByThread.get(row.id);
+      const source = candidates.get(row.id)?.source;
+      const sourceKnown = typeof source === 'string' && source.trim().length > 0;
+      const isAgent = row.isAgent ? true : sourceKnown ? false : null;
+      const parentId = typeof row.parentId === 'string' && row.parentId.trim().length > 0 && row.parentId.length <= 200 && !/[\u0000-\u001f\u007f-\u009f]/u.test(row.parentId) ? row.parentId : null;
+      if (parentId && !parentRecords.has(parentId)) parentRecords.set(parentId, get(stateDb, `SELECT ${threadFields} FROM threads WHERE id=?`, parentId));
+      const parent = parentRecords.get(parentId);
+      const parentAvailable = !!parent;
+      const startedAt = turn.startedAt != null && turn.startedAt <= now ? turn.startedAt : null;
+      const lastActivityAt = Math.max(startedAt || 0, turn.activityAt || 0) || null;
+      return { ...row, isAgent, parentId, parentAvailable,
+        parentLabel: parent ? clean(parent.agent_nickname || parent.name || parent.title || String(parent.id).slice(0, 8)) : null,
+        parentRunning: parentAvailable && runningIds.has(parentId), relationComplete: isAgent !== null && (!isAgent || parentAvailable),
+        depth: parentAvailable && Number.isSafeInteger(row.depth) && row.depth > 0 ? Math.min(row.depth, MAX_THREADS) : 0,
+        turnStartedAt: startedAt, runningMs: age(now, startedAt), lastActivityAt,
+        toolsPendingComplete: result.coverage.pendingComplete,
+      };
+    });
+    const byId = new Map(rows.map(row => [row.id, row]));
+    const cyclic = new Set();
+    for (const row of rows) {
+      const chain = [], positions = new Map();
+      let current = row;
+      while (current) {
+        if (positions.has(current.id)) {
+          for (const id of chain.slice(positions.get(current.id))) cyclic.add(id);
+          break;
+        }
+        positions.set(current.id, chain.length);
+        chain.push(current.id);
+        current = byId.get(current.parentId);
+      }
+    }
+    for (const row of rows) if (cyclic.has(row.id)) Object.assign(row, { parentId: null, parentAvailable: false, parentLabel: null, parentRunning: false, depth: 0, relationComplete: false });
+    const knownRoles = rows.every(row => row.isAgent !== null);
+    Object.assign(result.runtime, { available: true, complete: runtimeScanComplete && rows.every(row => row.relationComplete),
+      running: rows.length, main: knownRoles ? rows.filter(row => !row.isAgent).length : null, agents: knownRoles ? rows.filter(row => row.isAgent).length : null,
+      stale: [...runningByThread.values()].filter(turn => turn.stale).length, rows });
+  }
+
   if (availability.logs) {
     const levels = query(logsDb, "SELECT level, COUNT(*) AS n FROM logs WHERE ts>=? AND ts<=? AND level IN ('ERROR','WARN') GROUP BY level", Math.ceil((now - TEN_MINUTES) / 1000), Math.floor(now / 1000));
     result.alerts.error10m = Number(levels.find(row => row.level === 'ERROR')?.n || 0);
@@ -331,6 +386,9 @@ export function collectActivity({ historyDb = null, stateDb = null, logsDb = nul
   if (!availability.logs) result.alerts = { error10m: null, warn10m: null, errorPerMinute: null, warnPerMinute: null, recent: [] };
   if (!availability.queue) result.queue = { count: null, oldestWaitMs: null };
   if (!availability.goals) result.goals = { total: null, active: null, byStatus: {} };
+  if (!availability.history || !availability.state || !result.coverage.turnsAvailable) result.runtime = {
+    sampledAt: now, available: false, complete: false, running: null, main: null, agents: null, stale: null, rows: [],
+  };
   return result;
 }
 

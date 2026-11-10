@@ -1,7 +1,7 @@
 import { createTranslator, getLocale, resolveLocale } from './i18n.mjs';
 import { optionsCatalog } from './locales/options.mjs';
 
-export const VIEW_NAMES = { overview: '总览', host: '主机', tasks: '任务', diagnostics: '诊断' };
+export const VIEW_NAMES = { overview: '总览', host: '主机', tasks: '任务', diagnostics: '诊断', extensions: '扩展', running: '运行' };
 const t = createTranslator(optionsCatalog);
 const VALUE_OPTIONS = { '-i': 'interval', '--interval': 'interval', '--window': 'windowSeconds', '--view': 'view',
   '--interface': 'interfaceName', '--threads': 'threads', '--metrics-db': 'metricsDb', '--lang': 'lang', '--language': 'lang' };
@@ -73,8 +73,8 @@ export function parseOptions(args, { env = process.env } = {}) {
 
 export function reduceKey(state, key, pageRows = 20) {
   const next = { ...state };
-  const views = ['overview', 'host', 'tasks', 'diagnostics'];
-  if (/^[1-4]$/.test(key)) { next.view = views[Number(key) - 1]; next.leftOffset = 0; next.showHelp = false; }
+  const views = Object.keys(VIEW_NAMES);
+  if (/^[1-6]$/.test(key)) { next.view = views[Number(key) - 1]; next.leftOffset = 0; next.showHelp = false; }
   else if (key === ' ' || key === 'p') next.paused = !state.paused;
   else if (key === 'q' || key === '\x03') next.quit = true;
   else if (key === 'h' || key === '?') { next.showHelp = !state.showHelp; next.leftOffset = 0; }

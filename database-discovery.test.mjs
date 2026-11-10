@@ -8,7 +8,12 @@ import { createDatabaseRegistry, discoverDatabase } from './database-discovery.m
 
 function fixture(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-monitor-discovery-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const cleanup = [];
+  const beforeRemove = callback => cleanup.push(callback);
+  t.after(() => {
+    try { for (const callback of cleanup.toReversed()) callback(); }
+    finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
   const create = (file, sql, mtime) => {
     const filename = path.join(home, file);
     const db = new DatabaseSync(filename);
@@ -16,8 +21,12 @@ function fixture(t) {
     fs.utimesSync(filename, mtime, mtime);
     return filename;
   };
-  const discover = () => discoverDatabase({ home, prefix: 'state_', table: 'threads' });
-  return { home, create, discover };
+  const discover = () => {
+    const result = discoverDatabase({ home, prefix: 'state_', table: 'threads' });
+    if (result) beforeRemove(() => result.db.close());
+    return result;
+  };
+  return { home, create, discover, beforeRemove };
 }
 
 test('missing and empty data directories stay unavailable without creating files', t => {
@@ -38,7 +47,6 @@ test('corrupt newest candidates are skipped and an older usable database stays r
   const before = fs.readFileSync(good);
   const result = discover();
   assert.ok(result);
-  t.after(() => result.db.close());
   assert.equal(result.file, 'state_good.sqlite');
   assert.equal(result.db.prepare('SELECT id FROM threads').get().id, 'fixture');
   assert.throws(() => result.db.exec("INSERT INTO threads VALUES('must not write')"), /readonly|read-only/i);
@@ -56,7 +64,6 @@ test('selection requires a real named table and preserves newest-mtime preferenc
   create('state_backup.sqlite.bak', 'CREATE TABLE threads(id TEXT)', 600);
   const result = discover();
   assert.ok(result);
-  t.after(() => result.db.close());
   assert.equal(result.file, 'state_new.sqlite');
   assert.equal(result.db.prepare('SELECT count(*) AS count FROM threads').get().count, 0);
 });
@@ -86,7 +93,6 @@ test('failed and unmatched candidates close their handles while the selected han
   });
   const result = discover();
   assert.ok(result);
-  t.after(() => result.db.close());
   assert.equal(closed.length, 2);
   for (const db of closed) assert.throws(() => db.prepare('SELECT 1'), /not open|closed/i);
   assert.equal(result.db.prepare('SELECT 1 AS value').get().value, 1);
@@ -100,11 +106,25 @@ function registryFixture(t) {
     sources: { state: { prefix: 'state_', table: 'threads' }, logs: { prefix: 'logs_', table: 'logs' } },
     now: () => time,
   });
-  t.after(() => registry.close());
+  files.beforeRemove(() => registry.close());
   return { ...files, registry, at: value => { time = value; } };
 }
 
 const THREADS_SQL = "CREATE TABLE threads(id TEXT); INSERT INTO threads VALUES('first')";
+const openFileMutationSkip = process.platform === 'win32'
+  ? 'SQLite Windows VFS shares read/write access without FILE_SHARE_DELETE'
+  : false;
+
+function mockFileIdentity(t, filename) {
+  const originalStat = fs.statSync, originalFstat = fs.fstatSync;
+  const identity = originalStat(filename, { bigint: true });
+  let revision = 0n;
+  const revised = stat => stat.dev === identity.dev && stat.ino === identity.ino
+    ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { ino: stat.ino + revision }) : stat;
+  t.mock.method(fs, 'statSync', (...args) => revised(originalStat(...args)));
+  t.mock.method(fs, 'fstatSync', (...args) => revised(originalFstat(...args)));
+  return () => { revision++; };
+}
 
 test('registry discovers sources created after startup and refreshes all keys together', t => {
   const { create, registry, at } = registryFixture(t);
@@ -120,10 +140,10 @@ test('registry discovers sources created after startup and refreshes all keys to
 });
 
 test('registry discovers a directory created later without creating missing files itself', t => {
-  const { home } = fixture(t);
+  const { home, beforeRemove } = fixture(t);
   const lateHome = path.join(home, 'not-created-yet');
   const registry = createDatabaseRegistry({ home: lateHome, sources: { state: { prefix: 'state_', table: 'threads' } } });
-  t.after(() => registry.close());
+  beforeRemove(() => registry.close());
   assert.deepEqual(registry.refresh(), { state: null });
   assert.equal(fs.existsSync(lateHome), false);
   fs.mkdirSync(lateHome);
@@ -199,7 +219,7 @@ test('registry skips corrupt or incompatible new candidates and preserves the ex
   for (const db of closed) assert.throws(() => db.prepare('SELECT 1'), /not open|closed/i);
 });
 
-test('registry replaces a connection when the same pathname gets a new inode', t => {
+test('registry replaces a connection when the same pathname gets a new inode', { skip: openFileMutationSkip }, t => {
   const { home, create, registry, at } = registryFixture(t);
   const filename = create('state_1.sqlite', THREADS_SQL, 100);
   const first = registry.refresh().state;
@@ -214,7 +234,7 @@ test('registry replaces a connection when the same pathname gets a new inode', t
   assert.deepEqual(fs.readdirSync(home), ['state_1.sqlite']);
 });
 
-test('registry rejects a candidate swapped while opening and closes its discarded handle', t => {
+test('registry rejects a candidate swapped while opening and closes its discarded handle', { skip: openFileMutationSkip }, t => {
   const { create, registry, at } = registryFixture(t);
   create('state_1.sqlite', THREADS_SQL, 100);
   const first = registry.refresh().state;
@@ -246,7 +266,7 @@ test('registry rejects a candidate swapped while opening and closes its discarde
   assert.throws(() => first.db.prepare('SELECT 1'), /not open|closed/i);
 });
 
-test('registry falls back after deletion and releases a source when all candidates disappear', t => {
+test('registry falls back after deletion and releases a source when all candidates disappear', { skip: openFileMutationSkip }, t => {
   const { home, create, registry, at } = registryFixture(t);
   create('state_old.sqlite', THREADS_SQL, 100);
   const newest = create('state_new.sqlite', THREADS_SQL, 200);
@@ -261,6 +281,70 @@ test('registry falls back after deletion and releases a source when all candidat
   assert.equal(registry.refresh().state, null);
   assert.throws(() => fallback.db.prepare('SELECT 1'), /not open|closed/i);
   assert.deepEqual(fs.readdirSync(home), []);
+});
+
+test('registry replaces a connection after an injected file identity change on every platform', t => {
+  const { create, registry, at } = registryFixture(t);
+  const filename = create('state_1.sqlite', THREADS_SQL, 100);
+  const changeIdentity = mockFileIdentity(t, filename);
+  const first = registry.refresh().state;
+  changeIdentity();
+  at(5000);
+  const next = registry.refresh().state;
+  assert.equal(next.file, first.file);
+  assert.notEqual(next.db, first.db);
+  assert.equal(next.db.prepare('SELECT id FROM threads').get().id, 'first');
+  assert.throws(() => first.db.prepare('SELECT 1'), /not open|closed/i);
+  at(10000);
+  assert.equal(registry.refresh().state, next, 'the new identity can be retained without reopening again');
+});
+
+test('registry rejects an injected identity change during open before adopting that source later', t => {
+  const { create, registry, at } = registryFixture(t);
+  create('state_1.sqlite', THREADS_SQL, 100);
+  const first = registry.refresh().state;
+  const filename = create('state_2.sqlite', "CREATE TABLE threads(id TEXT); INSERT INTO threads VALUES('candidate')", 200);
+  const changeIdentity = mockFileIdentity(t, filename);
+  let changed = false;
+  const discarded = [];
+  const originalPrepare = DatabaseSync.prototype.prepare, originalClose = DatabaseSync.prototype.close;
+  t.mock.method(DatabaseSync.prototype, 'prepare', function (sql) {
+    if (!changed && this !== first.db) { changed = true; changeIdentity(); }
+    return originalPrepare.call(this, sql);
+  });
+  t.mock.method(DatabaseSync.prototype, 'close', function () { discarded.push(this); return originalClose.call(this); });
+  at(5000);
+  assert.equal(registry.refresh().state, first);
+  assert.equal(discarded.length, 1);
+  assert.throws(() => discarded[0].prepare('SELECT 1'), /not open|closed/i);
+  at(10000);
+  const next = registry.refresh().state;
+  assert.equal(next.file, 'state_2.sqlite');
+  assert.equal(next.db.prepare('SELECT id FROM threads').get().id, 'candidate');
+  assert.throws(() => first.db.prepare('SELECT 1'), /not open|closed/i);
+});
+
+test('registry falls back and closes sources after injected candidate-list disappearance on every platform', t => {
+  const { home, create, registry, at } = registryFixture(t);
+  create('state_old.sqlite', THREADS_SQL, 100);
+  const newest = create('state_new.sqlite', THREADS_SQL, 200);
+  const first = registry.refresh().state;
+  const hidden = new Set();
+  const originalRead = fs.readdirSync;
+  t.mock.method(fs, 'readdirSync', (directory, ...args) => {
+    const files = originalRead(directory, ...args);
+    return path.resolve(directory) === path.resolve(home) ? files.filter(file => !hidden.has(file)) : files;
+  });
+  hidden.add('state_new.sqlite');
+  at(5000);
+  const fallback = registry.refresh().state;
+  assert.equal(fallback.file, 'state_old.sqlite');
+  assert.throws(() => first.db.prepare('SELECT 1'), /not open|closed/i);
+  hidden.add('state_old.sqlite');
+  at(10000);
+  assert.equal(registry.refresh().state, null);
+  assert.throws(() => fallback.db.prepare('SELECT 1'), /not open|closed/i);
+  assert.equal(fs.existsSync(newest), true, 'the scenario does not unlink an open database file');
 });
 
 test('registry detects in-place corruption despite SQLite cached pages and can recover later', t => {

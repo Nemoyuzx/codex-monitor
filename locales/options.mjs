@@ -3,6 +3,8 @@ export const optionsCatalog = {
   'view.host': { 'zh-CN': '主机', 'zh-TW': '主機', en: 'Host', ja: 'ホスト' },
   'view.tasks': { 'zh-CN': '任务', 'zh-TW': '任務', en: 'Tasks', ja: 'タスク' },
   'view.diagnostics': { 'zh-CN': '诊断', 'zh-TW': '診斷', en: 'Diagnostics', ja: '診断' },
+  'view.extensions': { 'zh-CN': '扩展', 'zh-TW': '擴充', en: 'Extensions', ja: '拡張' },
+  'view.running': { 'zh-CN': '运行', 'zh-TW': '執行中', en: 'Running', ja: '実行中' },
   'error.missing': {
     'zh-CN': '{flag} 缺少参数', 'zh-TW': '{flag} 缺少參數',
     en: '{flag} requires a value', ja: '{flag} には値が必要です',
@@ -16,10 +18,10 @@ export const optionsCatalog = {
     en: '{field} must be an integer from {min} to {max}', ja: '{field} は {min}〜{max} の整数で指定してください',
   },
   'error.view': {
-    'zh-CN': '--view 可选 overview、host、tasks、diagnostics',
-    'zh-TW': '--view 可選 overview、host、tasks、diagnostics',
-    en: '--view must be one of overview, host, tasks, diagnostics',
-    ja: '--view は overview、host、tasks、diagnostics のいずれかを指定してください',
+    'zh-CN': '--view 可选 overview、host、tasks、diagnostics、extensions、running',
+    'zh-TW': '--view 可選 overview、host、tasks、diagnostics、extensions、running',
+    en: '--view must be one of overview, host, tasks, diagnostics, extensions, running',
+    ja: '--view は overview、host、tasks、diagnostics、extensions、running のいずれかを指定してください',
   },
   'error.language': {
     'zh-CN': '不支持的语言：{value}。可选 auto、zh-CN、zh-TW、en、ja',

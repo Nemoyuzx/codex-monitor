@@ -130,9 +130,20 @@ function parseOutput(result, { target, type, proxy, sampledAt }) {
 }
 
 const quoteConfig = value => `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
+function environmentSnapshot(environment, platform) {
+  const entries = Object.entries(environment || {}).filter(([, value]) => typeof value === 'string');
+  if (platform !== 'win32') return Object.fromEntries(entries);
+  const seen = new Set();
+  return Object.fromEntries(entries.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).filter(([key]) => {
+    const normalized = key.toUpperCase();
+    if (seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  }).map(([key, value]) => [key.toUpperCase(), value]));
+}
 function cleanEnvironment(environment) {
-  return Object.fromEntries(Object.entries(environment || {}).filter(([key, value]) => typeof value === 'string'
-    && !/proxy$/i.test(key) && !/^(?:CURL_HOME|CURL_CA_BUNDLE|SSLKEYLOGFILE)$/i.test(key)));
+  return Object.fromEntries(Object.entries(environment).filter(([key]) => !/proxy$/i.test(key)
+    && !/^(?:CURL_HOME|CURL_CA_BUNDLE|SSLKEYLOGFILE)$/i.test(key)));
 }
 
 /**
@@ -142,7 +153,8 @@ function cleanEnvironment(environment) {
  * Test-only targets/caFile let fixtures exercise TLS verification without --insecure.
  */
 export function createNetworkProbeSampler({ now = Date.now, run = defaultRun, env = () => process.env,
-  ttlMs = 60_000, timeoutMs = 5000, concurrency = 2, targets = DEFAULT_TARGETS, caFile = null, curlPath = 'curl' } = {}) {
+  ttlMs = 60_000, timeoutMs = 5000, concurrency = 2, targets = DEFAULT_TARGETS, caFile = null,
+  platform = process.platform, curlPath = platform === 'win32' ? 'curl.exe' : 'curl' } = {}) {
   const requestTimeout = Math.min(10_000, Math.max(100, Number(timeoutMs) || 5000));
   const maxConcurrent = Math.min(4, Math.max(1, Math.trunc(Number(concurrency) || 2)));
   for (const key of ['ip', 'connectivity']) {
@@ -197,6 +209,7 @@ export function createNetworkProbeSampler({ now = Date.now, run = defaultRun, en
       if (!enabled || closed) { controller?.abort(); return disabledResult(); }
       let environment = {};
       try { environment = typeof env === 'function' ? env() : env || {}; } catch {}
+      environment = environmentSnapshot(environment, platform);
       const selected = selectProxies(networkDetails, environment);
       const key = JSON.stringify([selected.map(route => [route.endpoint, route.sources, route.credentials]), networkDetails?.systemProxy?.pac?.enabled]);
       const at = now();

@@ -35,6 +35,14 @@ const data = {
   now, windowSeconds: 80, hist, view: 'overview', sampleMs: 84, intervalMs: 1000,
   sys: { mem: 24 * GB, ncpu: 12 }, load: [last('load'), 2.83, 2.61],
   tm: { memUsed: last('physicalMem') / 100 * 24 * GB, memComp: 1.2 * GB },
+  inventory: { sampledAt: now, available: true, coverage: { complete: true },
+    mcp: { available: true, total: 2, enabled: 2, disabled: 0, unknown: 0, items: [
+      { name: 'demo-local', type: 'stdio', enabled: true, source: 'user' },
+      { name: 'demo-remote', type: 'http', enabled: true, source: 'user' }] },
+    skills: { available: true, total: 3, enabled: 2, disabled: 1, unknown: 0, items: [
+      { name: 'demo-skill-one', enabled: true, source: 'user' },
+      { name: 'demo-skill-two', enabled: true, source: 'project' },
+      { name: 'demo-skill-three', enabled: false, source: 'plugin' }] } },
   pressurePercent: 38, swap: { used: 512 * MB, total: 2 * GB },
   host: {
     cpu: { logicalCores: 12, usagePercent: last('cpu'), perCore: [58, 46, 35, 29, 4, 2, 1, 2, 17, 14, 8, 6] },
@@ -121,7 +129,7 @@ function renderLocalizedDemo(locale) {
   const header = [
     paint('1;36', statusText('title')) + '  ' + paint('1;33', t('badge')),
     paint('2', t('source') + '  ' + MASK),
-    t('model') + ' ' + paint('36', MASK) + paint('2', ' · ' + t('summary')),
+    t('model') + ' ' + paint('36', MASK) + paint('2', ' · ' + t('summary') + ' · MCP 2' + statusText('skillCount', { count: 3 })),
     paint('2', '─'.repeat(layout.left)), t('status'), '',
   ];
   const primary = renderInformationSections([
@@ -141,7 +149,7 @@ function renderLocalizedDemo(locale) {
       paint('36', t('eventActive', { mask: MASK })),
       paint('36', t('eventUpdate', { mask: MASK })),
     ] },
-    section('TASKS'), section('TOOLS'), section('PROCESSES'),
+    section('CAPABILITIES'), section('TASKS'), section('TOOLS'), section('PROCESSES'),
   ], { width: layout.primary, color: true });
   const secondary = renderInformationSections([
     network, section('CODEX'), section('HEALTH'), section('METRICS'),

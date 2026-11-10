@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createPlatformSystemSampler } from './platform-system.mjs';
 
 const runTop = promisify(execFile);
 const rateFields = [
@@ -43,16 +44,41 @@ export function parseTopSnapshot(text, at, previous = null) {
   return out;
 }
 
-export function createTopSampler({ now = Date.now, cacheMs = 2500, run = runTop } = {}) {
+export function portableTopSnapshot(system, host, at) {
+  const result = { at, ...(system?.memory || {}) };
+  for (const [, output] of rateFields) result[output] = null;
+  const numeric = value => Number.isFinite(value) && value >= 0 ? value : undefined;
+  const cpu = numeric(host?.cpu?.usagePercent);
+  if (cpu !== undefined && cpu <= 100) result.cpuIdle = 100 - cpu;
+  const mappings = {
+    netByteIn: host?.network?.inBytes, netByteOut: host?.network?.outBytes,
+    netInRate: host?.network?.inRate, netOutRate: host?.network?.outRate,
+    diskByteRead: host?.disk?.readBytes, diskByteWrite: host?.disk?.writeBytes,
+    diskOpRead: host?.disk?.readOps, diskOpWrite: host?.disk?.writeOps,
+    diskReadRate: host?.disk?.readRate, diskWriteRate: host?.disk?.writeRate,
+    diskOpReadRate: host?.disk?.readIOPS, diskOpWriteRate: host?.disk?.writeIOPS,
+  };
+  for (const [key, value] of Object.entries(mappings)) if (numeric(value) !== undefined) result[key] = value;
+  return result;
+}
+
+export function createTopSampler({ now = Date.now, cacheMs = 2500, run = runTop, platform = process.platform,
+  portableSystem = createPlatformSystemSampler({ platform, now }) } = {}) {
   let cached = null, cachedAt = null, previous = null, pending = null;
   return {
-    sample({ force = false, signal } = {}) {
+    sample({ force = false, signal, systemSnapshot, hostSnapshot } = {}) {
       if (pending) return pending;
       const at = now();
       if (!force && cached && at >= cachedAt && at - cachedAt < cacheMs) return Promise.resolve(cached);
       pending = (async () => {
         let text = '';
         try {
+          if (platform !== 'darwin') {
+            const system = signal?.aborted ? null : systemSnapshot === undefined ? portableSystem.sample({ force }) : systemSnapshot;
+            cached = signal?.aborted ? parseTopSnapshot('', at) : portableTopSnapshot(system, hostSnapshot, at);
+            previous = cached; cachedAt = at;
+            return cached;
+          }
           if (!signal?.aborted) ({ stdout: text } = await run('top', ['-l', '1', '-n', '0'], {
             encoding: 'utf8', timeout: 3500, maxBuffer: 16 * 1024 * 1024, signal,
           }));

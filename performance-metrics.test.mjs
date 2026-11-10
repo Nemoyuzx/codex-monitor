@@ -12,14 +12,17 @@ const OTHER = '00000000-0000-4000-8000-000000000002';
 const NOW = 1_000_000;
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-monitor-metrics-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let db;
+  t.after(() => {
+    try { db?.close(); }
+    finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
   const file = path.join(dir, 'metrics.sqlite');
-  const db = new DatabaseSync(file);
+  db = new DatabaseSync(file);
   db.exec(`CREATE TABLE thread_metric_snapshots(actor_scope TEXT,local_scope TEXT,thread_id TEXT,revision TEXT,updated_at INTEGER,rollout_size INTEGER,rollout_mtime_ms REAL);
     CREATE TABLE thread_metric_values(actor_scope TEXT,local_scope TEXT,thread_id TEXT,field TEXT,value REAL,measured_at INTEGER,source TEXT,approximate INTEGER,lower_bound INTEGER,observed_since INTEGER,observed_responses INTEGER);
     CREATE TABLE thread_metric_purge_fences(thread_hash TEXT,cutoff_at INTEGER);
     PRAGMA user_version=2;`);
-  t.after(() => db.close());
   function put(field, value, extra = {}) {
     const row = { actor: 'private-actor', scope: 'private-scope', id: ID, at: NOW - 5_000,
       source: 'file', approximate: 0, lowerBound: 0, since: null, responses: null, ...extra };

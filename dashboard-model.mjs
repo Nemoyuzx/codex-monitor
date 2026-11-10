@@ -31,6 +31,105 @@ const millis = ms => finite(ms) ? ms < 1000 ? Math.round(ms) + 'ms' : (ms / 1000
 const byteScale = { format: n => bytes(n).replace(' ', '') };
 const percentScale = { max: 100, format: n => Math.round(n) + '%' };
 const row = (label, value, extra = {}) => ({ label, value, ...extra });
+const inventoryState = enabled => enabled === true ? t('已启用') : enabled === false ? t('已停用') : t('启用状态未验证');
+const inventorySource = source => ['user', 'project', 'admin', 'system', 'plugin'].includes(source) ? t('inventory.source.' + source) : t('未知');
+const inventoryType = type => ['stdio', 'http', 'sse'].includes(type) ? type.toUpperCase() : t('未知');
+
+function capabilitySummaryRows(inventory, host, now) {
+  const count = (group, key) => group?.available === true ? boundNumber(group[key], inventory?.coverage?.complete) : '—';
+  const mcp = inventory?.mcp, skills = inventory?.skills;
+  return [
+    row(t('Skill · 已安装 / 启用 / 停用'), ['total', 'enabled', 'disabled'].map(key => count(skills, key)).join(' / ')),
+    row(t('MCP · 已配置 / 启用 / 停用'), ['total', 'enabled', 'disabled'].map(key => count(mcp, key)).join(' / ')),
+    row(t('可辨 MCP 进程'), host?.processes?.available === true && host.processes.counts ? number(host.processes.counts.mcp ?? 0) : '—'),
+    row(t('启用状态未知 · Skill / MCP'), [count(skills, 'unknown'), count(mcp, 'unknown')].join(' / ')),
+    row(t('安装清单采集'), finite(inventory?.sampledAt) ? ago(Math.max(0, now - inventory.sampledAt)) : '—'),
+    row(t('安装清单范围'), inventory?.available !== true ? t('数据源不可用')
+      : inventory.coverage?.complete === false ? t('部分目录未能验证；≥ 表示已观测下界') : t('已扫描受支持的本地安装来源')),
+  ];
+}
+
+function extensionSections(inventory, host, now) {
+  const mcpRows = [row(t('MCP 口径'), t('配置清单不等于当前会话已加载；运行数量按可辨进程单列'))];
+  const skillRows = [row(t('Skill 口径'), t('已安装不等于本会话已加载；启用状态只依据明确配置'))];
+  for (const item of inventory?.mcp?.available === true ? inventory.mcp.items || [] : []) {
+    mcpRows.push(row(item.name || t('未命名 MCP'), inventoryType(item.type) + ' · ' + inventoryState(item.enabled), { separator: true }),
+      row(t('安装来源'), inventorySource(item.source)));
+  }
+  for (const item of inventory?.skills?.available === true ? inventory.skills.items || [] : []) {
+    skillRows.push(row(item.name || t('未命名 Skill'), inventoryState(item.enabled) + ' · ' + inventorySource(item.source), { separator: true }),
+      row(t('描述'), item.description || '—'), row(t('安装路径'), item.path || '—'));
+  }
+  if (!inventory?.mcp?.items?.length) mcpRows.push(row(t('MCP 列表'), inventory?.mcp?.available === true ? t('未发现已配置 MCP') : t('数据源不可用')));
+  if (!inventory?.skills?.items?.length) skillRows.push(row(t('Skill 列表'), inventory?.skills?.available === true ? t('未发现已安装 Skill') : t('数据源不可用')));
+  return [
+    { title: t('安装清单概览'), tag: 'CAPABILITIES', pane: 'primary', tone: 'cyan', rowLayout: 'adaptive', compact: true, rows: capabilitySummaryRows(inventory, host, now) },
+    { title: t('已配置 MCP'), tag: 'MCP', pane: 'primary', tone: 'cyan', rowLayout: 'adaptive', compact: true, rows: mcpRows },
+    { title: t('已安装 Skill'), tag: 'SKILLS', pane: 'secondary', tone: 'magenta', rowLayout: 'adaptive', compact: true, rows: skillRows },
+  ];
+}
+
+function runningSections(activity, now) {
+  const runtime = activity?.runtime;
+  const available = runtime?.available === true;
+  const counts = keys => keys.map(key => available ? boundNumber(runtime[key], runtime.complete) : '—').join(' / ');
+  const summary = [row(t('运行线程 / 主任务 / 子代理'), counts(['running', 'main', 'agents'])),
+    row(t('陈旧 inProgress 线程'), available ? boundNumber(runtime.stale, runtime.complete) : '—'),
+    row(t('运行数据采集'), finite(runtime?.sampledAt) ? ago(Math.max(0, now - runtime.sampledAt)) : '—'),
+    row(t('运行列表范围'), t('近1h inProgress；陈旧记录不计入运行列表')),
+    row(t('运行数量口径'), t('按唯一线程计数，不等于 turn 数或系统进程数')),
+    row(t('运行列表完整性'), !available ? t('数据源不可用') : runtime.complete === true ? t('已完整观测支持范围') : t('有界或部分采样；≥ 表示已观测下界'))];
+  const byId = new Map();
+  if (available) for (const task of runtime.rows || []) if (task?.id && !byId.has(task.id)) byId.set(task.id, task);
+  const parents = new Map([...byId].map(([id, task]) => [id,
+    task.parentId && byId.has(task.parentId) && task.parentId !== id && task.relationComplete !== false ? task.parentId : null]));
+  const cycles = new Set();
+  for (const id of byId.keys()) {
+    const chain = [], seen = new Map();
+    let current = id;
+    while (current && !seen.has(current)) { seen.set(current, chain.length); chain.push(current); current = parents.get(current); }
+    if (current) for (const cycleId of chain.slice(seen.get(current))) cycles.add(cycleId);
+  }
+  for (const id of cycles) parents.set(id, null);
+  const children = new Map();
+  for (const [id, parent] of parents) {
+    if (!children.has(parent)) children.set(parent, []);
+    children.get(parent).push(id);
+  }
+  const treeRows = [], linkRows = [];
+  const stack = (children.get(null) || []).toReversed().map(id => ({ id, depth: 0 }));
+  const visited = new Set();
+  while (stack.length) {
+    const { id, depth } = stack.pop(), task = byId.get(id);
+    if (visited.has(id)) continue;
+    visited.add(id);
+    const kind = task.isAgent === true ? t('子代理') : task.isAgent === false ? t('主任务') : t('类型未知');
+    const label = (depth ? '  '.repeat(Math.min(depth - 1, 8)) + '↳ ' : '') + (task.label || task.id);
+    const parts = [kind, t('运行 {time}', { time: elapsed(task.runningMs) }), task.model || '—',
+      t('待完成工具 {count}', { count: boundNumber(task.toolsPending, task.toolsPendingComplete) }),
+      t('活动 {age}', { age: finite(task.lastActivityAt) ? ago(Math.max(0, now - task.lastActivityAt)) : '—' })];
+    treeRows.push(row(label, parts.join(' · '), { tone: 'green', separator: true }));
+    if (task.isAgent === true || task.parentId || task.relationComplete === false || cycles.has(id)) {
+      let parent;
+      if (cycles.has(id) || task.parentId === id) parent = t('父子关系不完整或存在循环');
+      else if (task.parentId && task.parentAvailable === false) parent = t('父记录不可用 · {id}', { id: task.parentId });
+      else if (task.relationComplete === false) parent = t('父子关系不完整或存在循环');
+      else if (parents.get(id)) parent = t('父线程 {name} · 正在运行', { name: byId.get(parents.get(id)).label || parents.get(id) });
+      else if (task.parentAvailable === true && task.parentLabel) parent = t('父线程 {name} · 未列为运行中', { name: task.parentLabel });
+      else if (task.parentId) parent = t('父记录不可用 · {id}', { id: task.parentId });
+      else parent = t('未记录可验证的父线程');
+      linkRows.push(row(task.label || task.id, parent, { separator: true }));
+    }
+    for (const child of (children.get(id) || []).toReversed()) stack.push({ id: child, depth: depth + 1 });
+  }
+  if (!treeRows.length) treeRows.push(row(t('运行列表'), available ? t('当前没有近期运行线程') : t('数据源不可用')));
+  if (!linkRows.length) linkRows.push(row(t('子代理关系'), available ? t('当前没有可列出的运行子代理关系') : t('数据源不可用')));
+  return [
+    { title: t('运行任务概览'), tag: 'RUNNING_SUMMARY', pane: 'primary', tone: 'cyan', rowLayout: 'adaptive', compact: true, rows: summary },
+    { title: t('运行任务与子代理'), tag: 'RUNNING_TREE', pane: 'primary', tone: 'green', rowLayout: 'adaptive', compact: true, rows: treeRows },
+    { title: t('子代理父子关系'), tag: 'RUNNING_LINKS', pane: 'secondary', tone: 'magenta', rowLayout: 'adaptive', compact: true, rows: linkRows },
+  ];
+}
 
 function coreRows(cpu, width) {
   const values = cpu?.perCore || [];
@@ -77,7 +176,7 @@ function processRows(host, width, limit) {
       + padVis(bytes(p.rssBytes), 11) + p.name + ' · ' + p.role;
     rows.push(row('', padVis(truncVis(text, tableWidth), tableWidth), { priority: 40, optional: true }));
   }
-  rows.push(row(t('统计口径'), t('ps %CPU · RSS 求和含共享页'), { priority: 20, optional: true }));
+  rows.push(row(t('统计口径'), t('进程 CPU 依平台来源 · RSS 求和含共享页'), { priority: 20, optional: true }));
   return rows;
 }
 
@@ -192,11 +291,13 @@ function networkRows(details, compact, networkProbes, now) {
   if (proxy?.autoDiscovery) modes.push(t('自动发现'));
   const mode = !proxy ? '—' : entries.some(entry => entry.enabled == null) || proxy.pac?.enabled == null || proxy.autoDiscovery == null
     ? t('部分配置未知') : modes.length ? modes.join(' / ') : t('关闭（系统配置）');
+  const proxyLabel = proxy?.source === 'windows-user-internet-settings' ? t('系统代理 · 当前用户配置')
+    : proxy?.source === 'windows-machine-internet-settings' ? t('系统代理 · 计算机配置') : t('系统代理 · 全局配置');
   const rows = [row(t('网络接口'), details?.interfaceName || '—'),
     row(t('本机 IPv4'), list(details?.addresses?.ipv4)),
     row(t('默认网关 IPv4'), details?.routes?.ipv4?.gateway || '—'),
     row(t('系统 DNS'), list(details?.dns?.nameservers)),
-    row(t('系统代理 · 全局配置'), mode)];
+    row(proxyLabel, mode)];
   if (!compact) rows.splice(2, 0, row(t('本机 IPv6'), list(details?.addresses?.ipv6)));
   if (!compact) rows.splice(4, 0, row(t('默认网关 IPv6'), details?.routes?.ipv6?.gateway || '—'));
   for (const entry of compact ? enabled : entries) {
@@ -230,7 +331,7 @@ export function buildDashboard(options) {
   return options.locale ? withLocale(options.locale, () => buildLocalizedDashboard(options)) : buildLocalizedDashboard(options);
 }
 
-function buildLocalizedDashboard({ host, activity, performance, sys, tm, load, pressurePercent, swap, hist, now, windowSeconds,
+function buildLocalizedDashboard({ host, activity, performance, inventory, sys, tm, load, pressurePercent, swap, hist, now, windowSeconds,
   probes = [], storage = {}, sampleMs, intervalMs, networkDetails, networkProbes, legacyProbeState, view = 'overview', width = 100, limit = 8, noProbes = false }) {
   const history = key => hist[key] || [];
   const metric = (label, value, key, options = {}) => ({ label, value, historyKey: key, values: history(key), priority: 70, ...options });
@@ -264,7 +365,7 @@ function buildLocalizedDashboard({ host, activity, performance, sys, tm, load, p
   if (host?.pressure) hostRows.push(row(t('系统压力'), collectorState('pressure', host.pressure.state) || String(host.pressure.level), { key: 'pressure', priority: 50, optional: true }));
   const codexMetrics = [
     metric(t('Codex CPU · 多核'), pct(proc?.cpuPercent), 'codexCpu', { tone: tone(capacity && finite(proc?.cpuPercent) ? proc.cpuPercent / capacity : null),
-      detail: t('ps %CPU · 单核 100%'), scale: { max: Math.max(100, ...history('codexCpu').filter(finite)) * 1.1, format: n => number(n) + '%' }, priority: 100 }),
+      detail: t('进程 CPU · 单核 100%'), scale: { max: Math.max(100, ...history('codexCpu').filter(finite)) * 1.1, format: n => number(n) + '%' }, priority: 100 }),
     metric('Codex RSS', bytes(proc?.rssBytes), 'codexRss', { tone: 'magenta', scale: byteScale,
       detail: t('{count} 进程 · 含共享页重复', { count: number(proc?.items?.length) }), priority: 95 }),
     metric(t('工具完成 · 10m均值'), finite(activity?.tools?.completed10m) ? (activity?.coverage?.recentToolsComplete === false ? '≥' : '') + perSecond(activity.tools.completed10m / 600) : '—', 'toolRate', {
@@ -300,9 +401,13 @@ function buildLocalizedDashboard({ host, activity, performance, sys, tm, load, p
   const diagnostics = { title: t('链路与告警'), tag: 'HEALTH', tone: 'yellow', priority: 80, rowLayout: 'adaptive', compact: true, rows: diagnosticRows };
   const network = { title: t('IP · 路由 · 代理'), tag: 'NETWORK', tone: 'cyan', priority: 75,
     rowLayout: 'adaptive', rows: networkRows(networkDetails, view !== 'diagnostics', networkProbes, now) };
-  const pages = { overview: [hostSection, codexSection, tasks, tools, processes, diagnostics, perf, network],
+  const capabilitySummary = { title: t('MCP 与 Skill 数量'), tag: 'CAPABILITIES', tone: 'cyan', rowLayout: 'adaptive', compact: true,
+    rows: capabilitySummaryRows(inventory, host, now) };
+  const pages = { overview: [hostSection, codexSection, tasks, tools, processes, diagnostics, perf, network, capabilitySummary],
     host: [hostSection, network, processes], tasks: [tasks, tools, perf], diagnostics: [network, diagnostics, tools, perf] };
-  const model = { sections: pages[view] || pages.overview, times: hist.at || [], now, windowSeconds, locale: getLocale() };
+  const sections = view === 'extensions' ? extensionSections(inventory, host, now)
+    : view === 'running' ? runningSections(activity, now) : pages[view] || pages.overview;
+  const model = { sections, times: hist.at || [], now, windowSeconds, locale: getLocale() };
   // Regions reuse already-built resources rather than rebuilding every task,
   // process, network and performance row to obtain the overview charts.
   Object.defineProperty(model, dashboardResources, { value: [hostSection, codexSection] });
@@ -332,7 +437,7 @@ function buildLocalizedRegions(options, { detailWidth = 68 } = {}) {
     ],
   })).filter(section => section.rows.length);
   if (!options.view || options.view === 'overview') {
-    const order = ['NETWORK', 'TASKS', 'TOOLS', 'PROCESSES', 'HOST', 'CODEX', 'HEALTH', 'METRICS'];
+    const order = ['NETWORK', 'CAPABILITIES', 'TASKS', 'TOOLS', 'PROCESSES', 'HOST', 'CODEX', 'HEALTH', 'METRICS'];
     information.sort((a, b) => order.indexOf(a.tag) - order.indexOf(b.tag));
   }
   const systemStatus = { title: t('逐核与系统状态'), tag: 'SYSTEM', tone: 'cyan', rows: [

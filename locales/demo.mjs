@@ -219,10 +219,10 @@ const entries = [
   ],
   [
     "keyboard",
-    " [1 总览]   2 主机   3 任务   4 诊断   ·   Space 暂停   ↑↓ 滚动   [ ] 时间窗口   r 刷新   h 帮助   q 退出",
-    " [1 總覽]   2 主機   3 任務   4 診斷   ·   Space 暫停   ↑↓ 捲動   [ ] 時間視窗   r 更新   h 說明   q 離開",
-    " [1 Overview]   2 Host   3 Tasks   4 Diagnostics   ·   Space pause   ↑↓ scroll   [ ] time window   r refresh   h help   q quit",
-    " [1 概要]   2 ホスト   3 タスク   4 診断   ·   Space 一時停止   ↑↓ スクロール   [ ] 時間幅   r 更新   h ヘルプ   q 終了"
+    " [1 总览]   2 主机   3 任务   4 诊断   5 扩展   6 运行   ·   Space 暂停   ↑↓ 滚动   [ ] 时间窗口   r 刷新   h 帮助   q 退出",
+    " [1 總覽]   2 主機   3 任務   4 診斷   5 擴充   6 執行中   ·   Space 暫停   ↑↓ 捲動   [ ] 時間視窗   r 更新   h 說明   q 離開",
+    " [1 Overview]   2 Host   3 Tasks   4 Diagnostics   5 Extensions   6 Running   ·   Space pause   ↑↓ scroll   [ ] time window   r refresh   h help   q quit",
+    " [1 概要]   2 ホスト   3 タスク   4 診断   5 拡張   6 実行中   ·   Space 一時停止   ↑↓ スクロール   [ ] 時間幅   r 更新   h ヘルプ   q 終了"
   ],
   [
     "footer",

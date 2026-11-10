@@ -42,6 +42,9 @@ test('missing databases and missing schemas leave unavailable values blank', t =
   assert.equal(r.queue.oldestWaitMs, null);
   assert.equal(r.goals.active, null);
   assert.deepEqual(r.sessions.rows, []);
+  assert.equal(r.runtime.available, false);
+  assert.equal(r.runtime.running, null);
+  assert.deepEqual(r.runtime.rows, []);
 });
 
 test('tool aggregation covers more threads than the visible table and includes failed completions', t => {
@@ -130,6 +133,129 @@ test('agent hierarchy comes from source or spawn edges and Unix-second legacy ti
   assert.equal(r.tokens.unarchived, 300);
 });
 
+test('running task inventory is independent of display limits and deduplicates active turns by thread', t => {
+  const { db, thread, item, options } = fixture(t);
+  const turn = db.prepare('INSERT INTO thread_turns VALUES(?,?,?,?)');
+  for (let i = 0; i < 8; i++) {
+    thread('running-' + i, i < 4 ? {} : { source: JSON.stringify({ subagent: { thread_spawn: { parent_thread_id: 'running-0', depth: 1 } } }) });
+    turn.run('running-' + i, 'turn', 'inProgress', (NOW - 30000 - i * 1000) / 1000);
+    item('running-' + i, 1, { completed_at_ms: i === 7 ? null : NOW, item_json: JSON.stringify({ status: i === 7 ? 'inProgress' : 'completed' }) });
+  }
+  turn.run('running-0', 'another-turn', 'inProgress', (NOW - 1000) / 1000);
+  thread('historical', { updated_at_ms: NOW });
+  turn.run('historical', 'turn', 'inProgress', (NOW - 3 * HOUR) / 1000);
+  item('historical', 1, { created_at_ms: NOW - 2 * HOUR, completed_at_ms: NOW - 2 * HOUR });
+  thread('recent-completed');
+  turn.run('recent-completed', 'turn', 'completed', (NOW - 1000) / 1000);
+  const r = collectActivity({ ...options, threads: 1 });
+  assert.equal(r.sessions.rows.length, 1);
+  assert.equal(r.turns.recentRunning, 9);
+  assert.equal(r.runtime.available, true);
+  assert.equal(r.runtime.complete, true);
+  assert.equal(r.runtime.sampledAt, NOW);
+  assert.equal(r.runtime.running, 8);
+  assert.equal(r.runtime.main, 4);
+  assert.equal(r.runtime.agents, 4);
+  assert.equal(r.runtime.stale, 1);
+  assert.equal(r.runtime.rows.length, 8);
+  assert.ok(r.runtime.rows.every(row => row.status === 'inProgress' && !row.stale));
+  assert.ok(!r.runtime.rows.some(row => ['historical', 'recent-completed'].includes(row.id)));
+  const child = r.runtime.rows.find(row => row.id === 'running-7');
+  assert.equal(child.parentId, 'running-0');
+  assert.equal(child.parentAvailable, true);
+  assert.equal(child.parentRunning, true);
+  assert.equal(child.parentLabel, 'running-0');
+  assert.equal(child.toolsPending, 1);
+  assert.equal(child.toolsPendingComplete, true);
+  assert.equal(child.model, 'test-model');
+});
+
+test('running inventory preserves real inactive parents and rejects missing or cyclic nesting', t => {
+  const { db, thread, options } = fixture(t);
+  const turn = db.prepare('INSERT INTO thread_turns VALUES(?,?,?,?)');
+  thread('inactive-parent', { updated_at_ms: NOW - 2 * HOUR, title: 'Actual parent title' });
+  for (const [id, parent] of [['inactive-child', 'inactive-parent'], ['orphan', 'absent-parent'], ['cycle-a', 'cycle-b'], ['cycle-b', 'cycle-a'], ['self', 'self']]) {
+    thread(id, { source: JSON.stringify({ subagent: { thread_spawn: { parent_thread_id: parent, depth: 3 } } }) });
+    turn.run(id, 'turn', 'inProgress', (NOW - 1000) / 1000);
+  }
+  const r = collectActivity(options);
+  assert.equal(r.runtime.available, true);
+  assert.equal(r.runtime.complete, false);
+  assert.equal(r.runtime.agents, 5);
+  const inactiveChild = r.runtime.rows.find(row => row.id === 'inactive-child');
+  assert.equal(inactiveChild.parentAvailable, true);
+  assert.equal(inactiveChild.parentRunning, false);
+  assert.equal(inactiveChild.parentLabel, 'Actual parent title');
+  const orphan = r.runtime.rows.find(row => row.id === 'orphan');
+  assert.equal(orphan.parentId, 'absent-parent');
+  assert.equal(orphan.parentAvailable, false);
+  assert.equal(orphan.parentLabel, null);
+  assert.equal(orphan.depth, 0);
+  assert.equal(orphan.relationComplete, false);
+  for (const id of ['cycle-a', 'cycle-b', 'self']) {
+    const row = r.runtime.rows.find(row => row.id === id);
+    assert.equal(row.parentId, null);
+    assert.equal(row.parentLabel, null);
+    assert.equal(row.depth, 0);
+    assert.equal(row.relationComplete, false);
+  }
+});
+
+test('missing source metadata leaves running task roles unknown while spawn edges still prove agents', t => {
+  const { db, thread, options } = fixture(t);
+  thread('unclassified'); thread('child');
+  db.exec("ALTER TABLE threads DROP COLUMN source; INSERT INTO thread_spawn_edges VALUES('unclassified','child')");
+  const turn = db.prepare('INSERT INTO thread_turns VALUES(?,?,?,?)');
+  for (const id of ['unclassified', 'child']) turn.run(id, 'turn', 'inProgress', NOW / 1000);
+  const r = collectActivity(options);
+  assert.equal(r.runtime.available, true);
+  assert.equal(r.runtime.running, 2);
+  assert.equal(r.runtime.main, null);
+  assert.equal(r.runtime.agents, null);
+  assert.equal(r.runtime.complete, false);
+  assert.equal(r.runtime.rows.find(row => row.id === 'unclassified').isAgent, null);
+  assert.equal(r.runtime.rows.find(row => row.id === 'child').isAgent, true);
+});
+
+test('running inventory discloses the scan bound without applying the visible table limit', t => {
+  const { db, thread, options } = fixture(t);
+  const turn = db.prepare('INSERT INTO thread_turns VALUES(?,?,?,?)');
+  db.exec('BEGIN');
+  for (let i = 0; i < 260; i++) {
+    const id = 'bounded-running-' + i;
+    thread(id);
+    turn.run(id, 'turn', 'inProgress', (NOW - i * 1000) / 1000);
+  }
+  db.exec('COMMIT');
+  const r = collectActivity({ ...options, threads: 1 });
+  assert.equal(r.turns.totalRunning, 260);
+  assert.equal(r.runtime.available, true);
+  assert.equal(r.runtime.complete, false);
+  assert.equal(r.runtime.running, 256);
+  assert.equal(r.runtime.rows.length, 256);
+  assert.equal(r.sessions.rows.length, 1);
+});
+
+test('runtime requires valid recent activity and never turns future-only timestamps into running tasks', t => {
+  const { db, thread, item, options } = fixture(t);
+  const turn = db.prepare('INSERT INTO thread_turns VALUES(?,?,?,?)');
+  thread('future'); thread('long-running'); thread('fresh-evidence');
+  turn.run('future', 'turn', 'inProgress', (NOW + HOUR) / 1000);
+  turn.run('long-running', 'turn', 'inProgress', (NOW - 3 * HOUR) / 1000);
+  item('long-running', 1);
+  turn.run('fresh-evidence', 'turn', 'inProgress', (NOW + HOUR) / 1000);
+  item('fresh-evidence', 1, { completed_at_ms: NOW + HOUR });
+  const r = collectActivity(options);
+  assert.equal(r.runtime.running, 2);
+  assert.equal(r.runtime.complete, false);
+  assert.ok(!r.runtime.rows.some(row => row.id === 'future'));
+  assert.equal(r.runtime.rows.find(row => row.id === 'long-running').runningMs, 3 * HOUR);
+  const fresh = r.runtime.rows.find(row => row.id === 'fresh-evidence');
+  assert.equal(fresh.turnStartedAt, null);
+  assert.equal(fresh.runningMs, null);
+  assert.equal(fresh.lastActivityAt, NOW - 1000);
+});
+
 test('queue waiting and truly active goals use statuses rather than table row counts', t => {
   const { db, options } = fixture(t);
   db.exec("INSERT INTO thread_goals VALUES('paused'),('complete'),('blocked'),('active'),('active')");
@@ -201,10 +327,12 @@ test('a failed query invalidates only its source and never turns unavailable obs
       assert.equal(r.turns.totalRunning, null); assert.equal(r.sessions.rows[0].toolsPending, null);
       assert.equal(r.sessions.rows[0].status, 'unknown');
       assert.equal(r.coverage.recentToolsComplete, false);
+      assert.equal(r.runtime.available, false); assert.equal(r.runtime.running, null); assert.deepEqual(r.runtime.rows, []);
     }],
     ['state', 'stateDb', sql => sql.includes('SUM(tokens_used)'), r => {
       assert.equal(r.tokens.total, null); assert.equal(r.sessions.total, null);
       assert.equal(r.tools.completed10m, null); assert.deepEqual(r.sessions.rows, []);
+      assert.equal(r.runtime.available, false); assert.equal(r.runtime.main, null); assert.deepEqual(r.runtime.rows, []);
     }],
     ['logs', 'logsDb', sql => sql.includes('SELECT level, COUNT(*)'), r => {
       assert.equal(r.alerts.error10m, null); assert.equal(r.alerts.warn10m, null);
@@ -282,6 +410,9 @@ test('missing or incompatible turns schema leaves item metrics usable but candid
     assert.equal(r.coverage.complete, false);
     assert.equal(r.coverage.pendingComplete, false);
     assert.equal(r.coverage.recentToolsComplete, false);
+    assert.equal(r.runtime.available, false);
+    assert.equal(r.runtime.running, null);
+    assert.deepEqual(r.runtime.rows, []);
   }
 });
 

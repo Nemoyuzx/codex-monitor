@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildDashboard, buildDashboardRegions } from './dashboard-model.mjs';
 import { renderResourcePanel, visLen } from './resource-panel.mjs';
+import { dashboardLayout, renderInformationSections, composeInformationPane } from './dashboard-layout.mjs';
+
+const views = ['overview', 'host', 'tasks', 'diagnostics', 'extensions', 'running'];
 
 function sample(overrides = {}) {
   return {
@@ -32,7 +35,7 @@ test('dashboard uses physical memory, completion timestamps and Codex-only proce
 });
 
 test('absent system and telemetry data remain unknown on every page', () => {
-  for (const view of ['overview', 'host', 'tasks', 'diagnostics']) {
+  for (const view of views) {
     const model = buildDashboard(sample({ host: {}, activity: {}, sys: {}, tm: {}, view }));
     const metrics = model.sections.flatMap(section => section.metrics || []);
     for (const metric of metrics.filter(metric => /全机|物理内存|Codex CPU|RSS|工具完成/.test(metric.label))) assert.equal(metric.value, '—');
@@ -54,7 +57,7 @@ test('cached native performance always carries provenance and an age', () => {
 });
 
 test('resource charts stay separate from tasks, processes and diagnostics on every page', () => {
-  for (const view of ['overview', 'host', 'tasks', 'diagnostics']) {
+  for (const view of views) {
     const { charts, information, systemStatus } = buildDashboardRegions(sample({ view }), { detailWidth: 68 });
     assert.deepEqual(charts.sections.map(section => section.tag), ['HOST', 'CODEX']);
     assert.equal(charts.sections.flatMap(section => section.metrics).length, 8);
@@ -66,6 +69,8 @@ test('resource charts stay separate from tasks, processes and diagnostics on eve
     if (view === 'overview' || view === 'tasks') assert.ok(tags.includes('TASKS') && tags.includes('TOOLS') && tags.includes('METRICS'));
     if (view === 'overview' || view === 'host') assert.ok(tags.includes('PROCESSES'));
     if (view === 'overview' || view === 'diagnostics') assert.ok(tags.includes('HEALTH'));
+    if (view === 'extensions') assert.deepEqual(tags, ['CAPABILITIES', 'MCP', 'SKILLS']);
+    if (view === 'running') assert.deepEqual(tags, ['RUNNING_SUMMARY', 'RUNNING_TREE', 'RUNNING_LINKS']);
   }
 });
 
@@ -85,6 +90,17 @@ test('network addresses, routes and proxy configuration are left-side informatio
   for (const value of ['192.0.2.3', '192.0.2.1', '2001:db8::3', '192.0.2.53', 'HTTP_PROXY', '本机端口可连接', 'utun2']) assert.ok(text.includes(value));
   assert.ok(text.includes('实际请求路径'));
   assert.ok(!JSON.stringify(regions.charts).includes('HTTP_PROXY'));
+  for (const [source, label, english] of [
+    ['windows-user-internet-settings', '系统代理 · 当前用户配置', 'System proxy · current-user config'],
+    ['windows-machine-internet-settings', '系统代理 · 计算机配置', 'System proxy · machine config'],
+  ]) for (const locale of ['zh-CN', 'en']) {
+    const scoped = buildDashboard(sample({ locale, networkDetails: { systemProxy: { source,
+      http: { enabled: false }, https: { enabled: false }, socks: { enabled: false }, pac: { enabled: false }, autoDiscovery: false } } }));
+    const rows = scoped.sections.find(section => section.tag === 'NETWORK').rows;
+    const expected = locale === 'en' ? english : label;
+    assert.ok(rows.some(row => row.label === expected), source + ': ' + locale);
+    assert.ok(!rows.some(row => row.label === '系统代理 · 全局配置' || row.label === 'System proxy · global config'));
+  }
 });
 
 function networkResult(overrides = {}) {
@@ -132,4 +148,87 @@ test('disabled external probes are explicitly disabled and partial successes sta
   const rows = model.sections.find(section => section.tag === 'NETWORK').rows;
   assert.equal(rows.find(row => row.label === '代理1 实测状态').value, '部分目标可达');
   assert.match(rows.find(row => row.label === '代理1 HTTPS').value, /HTTP 204/);
+});
+
+test('installation pages distinguish observed configuration, enablement and running processes without leaking extra configuration', () => {
+  const inventory = { sampledAt: 900_000, available: true, coverage: { complete: false },
+    mcp: { available: true, total: 2, enabled: 1, disabled: 0, unknown: 1, items: [
+      { name: '测试 MCP', type: 'stdio', enabled: true, source: 'user', env: { API_KEY: 'secret-key-must-not-render' } },
+      { name: 'remote', type: 'http', enabled: null, source: 'project', url: 'https://secret-user:secret-password@example.test' },
+    ] },
+    skills: { available: true, total: 2, enabled: 0, disabled: 1, unknown: 1, items: [
+      { name: '我的技能', enabled: false, source: 'project', description: '保留用户说明，不自动翻译', path: '/fixture/project/.agents/skills/example/SKILL.md' },
+      { name: 'plugin-skill', enabled: null, source: 'plugin', description: 'Installed with unverified enablement', path: '/fixture/plugins/example/SKILL.md' },
+    ] } };
+  const options = sample({ view: 'extensions', inventory, limit: 1 });
+  options.host.processes.counts.mcp = 7;
+  const before = JSON.stringify(options);
+  const model = buildDashboard(options);
+  const summary = model.sections.find(section => section.tag === 'CAPABILITIES').rows;
+  assert.equal(summary.find(row => row.label === 'Skill · 已安装 / 启用 / 停用').value, '≥2 / ≥0 / ≥1');
+  assert.equal(summary.find(row => row.label === 'MCP · 已配置 / 启用 / 停用').value, '≥2 / ≥1 / ≥0');
+  assert.equal(summary.find(row => row.label === '可辨 MCP 进程').value, '7');
+  assert.equal(summary.find(row => row.label === '启用状态未知 · Skill / MCP').value, '≥1 / ≥1');
+  const text = JSON.stringify(model);
+  for (const value of ['测试 MCP', 'remote', '我的技能', '保留用户说明，不自动翻译', '/fixture/project/', 'plugin-skill', '启用状态未验证', '1m40s前']) assert.ok(text.includes(value), value);
+  for (const secret of ['secret-key-must-not-render', 'secret-password', 'secret-user']) assert.ok(!text.includes(secret), secret);
+  assert.equal(JSON.stringify(options), before);
+  assert.equal(buildDashboard(sample({ inventory })).sections.find(section => section.tag === 'CAPABILITIES').rows[0].value, '≥2 / ≥0 / ≥1');
+});
+
+test('unknown inventory stays unknown and the complete installed list remains reachable by scrolling', () => {
+  const unknown = buildDashboard(sample({ view: 'extensions' }));
+  const summary = unknown.sections.find(section => section.tag === 'CAPABILITIES').rows;
+  assert.equal(summary.find(row => row.label === 'Skill · 已安装 / 启用 / 停用').value, '— / — / —');
+  assert.ok(JSON.stringify(unknown).includes('数据源不可用'));
+  const skills = Array.from({ length: 40 }, (_, index) => ({ name: 'skill-' + String(index).padStart(2, '0'), description: 'Long description '.repeat(8), path: '/fixture/skills/' + index + '/SKILL.md', source: 'user', enabled: true }));
+  const inventory = { sampledAt: 1_000_000, available: true, coverage: { complete: true },
+    mcp: { available: true, total: 0, enabled: 0, disabled: 0, unknown: 0, items: [] },
+    skills: { available: true, total: skills.length, enabled: skills.length, disabled: 0, unknown: 0, items: skills } };
+  const { information } = buildDashboardRegions(sample({ view: 'extensions', inventory, limit: 1 }));
+  const section = information.find(section => section.tag === 'SKILLS');
+  assert.equal(section.rows.filter(row => row.label.startsWith('skill-')).length, 40);
+  const layout = dashboardLayout(251);
+  const secondary = renderInformationSections([section], { width: layout.secondary });
+  assert.ok(secondary.every(line => visLen(line) <= layout.secondary));
+  const last = composeInformationPane({ secondary }, { layout, height: 20, offset: 1e9, scroll: true });
+  assert.ok(last.rows.join('').includes('/fixture/skills/39/SKILL.md'));
+});
+
+test('the running page keeps every observed running thread, real parents and conservative incomplete relationships', () => {
+  const task = (id, overrides = {}) => ({ id, label: 'task-' + id, model: 'fixture-model', runningMs: 60_000, lastActivityAt: 999_000, toolsPending: 0, isAgent: false, parentId: null, ...overrides });
+  const runtime = { sampledAt: 999_000, available: true, complete: false, running: 7, main: 1, agents: 6, stale: 12, rows: [
+    task('child', { isAgent: true, parentId: 'main' }), task('main'),
+    task('orphan', { isAgent: true, parentId: 'missing', parentAvailable: false }),
+    task('known-parent', { isAgent: true, parentId: 'finished-parent', parentAvailable: true, parentLabel: '已结束的真实父任务', parentRunning: false }),
+    task('cycle-a', { isAgent: true, parentId: 'cycle-b' }), task('cycle-b', { isAgent: true, parentId: 'cycle-a' }),
+    task('unknown-parent', { isAgent: true, parentId: null, relationComplete: false }),
+  ] };
+  const options = sample({ view: 'running', limit: 1 });
+  options.activity.runtime = runtime;
+  options.activity.sessions.rows.push({ id: 'old', label: '历史遗留，不可显示为运行任务', status: 'stale' });
+  const before = JSON.stringify(options), model = buildDashboard(options);
+  const tree = model.sections.find(section => section.tag === 'RUNNING_TREE').rows;
+  assert.equal(tree.length, 7);
+  assert.ok(tree.findIndex(row => row.label === 'task-main') < tree.findIndex(row => row.label === '↳ task-child'));
+  for (const task of runtime.rows) assert.equal(tree.filter(row => row.label.endsWith(task.label)).length, 1, task.id);
+  assert.ok(!tree.some(row => row.label === '↳ task-orphan' || row.label.startsWith('↳ task-cycle')));
+  assert.ok(!JSON.stringify(model).includes('历史遗留，不可显示为运行任务'));
+  const links = model.sections.find(section => section.tag === 'RUNNING_LINKS').rows;
+  assert.match(links.find(row => row.label === 'task-child').value, /父线程 task-main · 正在运行/);
+  assert.match(links.find(row => row.label === 'task-orphan').value, /父记录不可用 · missing/);
+  assert.match(links.find(row => row.label === 'task-known-parent').value, /已结束的真实父任务 · 未列为运行中/);
+  for (const id of ['cycle-a', 'cycle-b', 'unknown-parent']) assert.match(links.find(row => row.label === 'task-' + id).value, /不完整或存在循环/);
+  const summary = model.sections.find(section => section.tag === 'RUNNING_SUMMARY').rows;
+  assert.equal(summary.find(row => row.label === '运行线程 / 主任务 / 子代理').value, '≥7 / ≥1 / ≥6');
+  assert.equal(summary.find(row => row.label === '陈旧 inProgress 线程').value, '≥12');
+  assert.equal(JSON.stringify(options), before);
+});
+
+test('unavailable running sources never revive the general recent-session list', () => {
+  const model = buildDashboard(sample({ view: 'running' }));
+  const summary = model.sections.find(section => section.tag === 'RUNNING_SUMMARY').rows;
+  assert.equal(summary[0].value, '— / — / —');
+  assert.ok(!JSON.stringify(model).includes('任务甲'));
+  assert.ok(JSON.stringify(model).includes('数据源不可用'));
 });

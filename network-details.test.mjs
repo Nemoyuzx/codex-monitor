@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import test from 'node:test';
 import { createNetworkDetailsSampler, environmentProxyState, parseDefaultRoute, parseDnsConfiguration,
-  parseSystemProxy, redactNetworkEndpoint } from './network-details.mjs';
+  parseSystemProxy, redactNetworkEndpoint, parseLinuxDefaultRoute, parseLinuxProcRoute, parseResolvConf,
+  parseWindowsSystemProxy, parseWindowsNetworkConfiguration } from './network-details.mjs';
 
 const proxyFixture = `<dictionary> {
   ExceptionsList : <array> {
@@ -218,13 +219,185 @@ test('port checks only target enabled valid loopback listeners and cap timeout a
 });
 
 test('unsupported platforms leave system sources unknown while explicit interface and env remain available', async () => {
-  const { sampler, state } = fixture({ sampler: { platform: 'linux' } });
+  const { sampler, state } = fixture({ sampler: { platform: 'freebsd' } });
   const result = await sampler.sample({ interfaceName: 'en7' });
   assert.deepEqual(result.addresses.ipv4, ['10.0.0.2']);
   assert.equal(result.systemProxy, null);
   assert.equal(result.dns, null);
   assert.equal(state.calls.length, 0);
   assert.equal(state.probes.length, 0);
+});
+
+const linuxRoute4 = 'Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n'
+  + 'eth0 00000000 010200C0 0003 0 0 100 00000000 0 0 0\n'
+  + 'eth1 00000000 016433C6 0003 0 0 20 00000000 0 0 0\n';
+const linuxRoute6 = '00000000000000000000000000000000 00 00000000000000000000000000000000 00 '
+  + 'fe800000000000000000000000000001 00000064 00000000 00000000 00000003 eth0\n';
+
+test('Linux route and resolver parsers select usable default metrics and retain unavailable sources', () => {
+  assert.deepEqual(parseLinuxDefaultRoute(JSON.stringify([
+    { dst: 'default', dev: 'eth0', gateway: '192.0.2.1', metric: 100 },
+    { dst: 'default', dev: 'eth1', gateway: '198.51.100.1', metric: 20 },
+    { dst: 'default', dev: 'eth2', gateway: '203.0.113.1', metric: 1, flags: ['linkdown'] },
+    { dst: '192.0.2.0/24', dev: 'eth3', gateway: '192.0.2.1' },
+  ])), { interfaceName: 'eth1', gateway: '198.51.100.1' });
+  assert.deepEqual(parseLinuxDefaultRoute('[{"dst":"default","dev":"tun0"}]'), { interfaceName: 'tun0', gateway: null });
+  assert.equal(parseLinuxDefaultRoute('[]'), null);
+  assert.equal(parseLinuxDefaultRoute('command failed'), null);
+  assert.equal(parseLinuxDefaultRoute('[{"dst":"default","dev":"eth0","gateway":"::1"}]'), null);
+  assert.equal(parseLinuxDefaultRoute('[{"dst":"default","dev":"eth0","flags":{"includes":"not a method"}}]'), null);
+  assert.equal(parseLinuxDefaultRoute('[{"dst":"default","dev":"eth0","from":"192.0.2.0/24"}]'), null);
+  assert.deepEqual(parseLinuxProcRoute(linuxRoute4), { interfaceName: 'eth1', gateway: '198.51.100.1' });
+  assert.deepEqual(parseLinuxProcRoute(linuxRoute4.replace('016433C6', 'C6336401'), 4, 'BE'), { interfaceName: 'eth1', gateway: '198.51.100.1' });
+  assert.deepEqual(parseLinuxProcRoute(linuxRoute6, 6), { interfaceName: 'eth0', gateway: 'fe80:0000:0000:0000:0000:0000:0000:0001' });
+  assert.equal(parseLinuxProcRoute(linuxRoute4.replaceAll('0003', '0201')), null, 'rejected routes are not defaults');
+  assert.equal(parseLinuxProcRoute(linuxRoute6.replace(' 00 00000000000000000000000000000000 00 ', ' 00 20010db8000000000000000000000000 40 '), 6), null);
+  assert.equal(parseLinuxProcRoute(null), null);
+  assert.deepEqual(parseResolvConf('# managed locally\nnameserver 127.0.0.53\nnameserver 2001:db8::53 # DNS\nnameserver 127.0.0.53\nnameserver user:password@host\nsearch private.example\n'),
+    { nameservers: ['127.0.0.53', '2001:db8::53'] });
+  assert.deepEqual(parseResolvConf('search example.test\n'), { nameservers: [] });
+  assert.equal(parseResolvConf(null), null);
+});
+
+test('Linux configuration uses JSON routes, bounded local resolver reads, and unknown global proxy settings', async () => {
+  let at = 0, calls = 0, reads = 0, interfacesRead = 0;
+  const sampler = createNetworkDetailsSampler({ platform: 'linux', now: () => at,
+    async run(file, args) {
+      calls++;
+      assert.equal(file, 'ip');
+      return args.includes('-6') ? '[]' : '[{"dst":"default","dev":"eth0","gateway":"192.0.2.1","metric":5}]';
+    },
+    async readFile(file) { reads++; return file === '/etc/resolv.conf' ? 'nameserver 192.0.2.53\n' : file.endsWith('ipv6_route') ? linuxRoute6 : linuxRoute4; },
+    networkInterfaces() { interfacesRead++; return { eth0: [{ family: 4, address: '192.0.2.2', internal: false }],
+      wg0: [{ family: 'IPv4', address: '10.0.0.2', internal: false }] }; },
+    environment: () => ({ HTTPS_PROXY: 'http://user:password@127.0.0.1:7890/path?token=secret' }),
+    probe() { assert.fail('Linux environment proxy configuration is not a system-proxy port check'); },
+  });
+  const [first, concurrent] = await Promise.all([sampler.sample(), sampler.sample()]);
+  assert.equal(first, concurrent);
+  assert.equal(first.interfaceName, 'eth0');
+  assert.deepEqual(first.addresses.ipv4, ['192.0.2.2']);
+  assert.equal(first.routes.ipv6, null, 'a valid empty route response is not replaced by a contradictory proc source');
+  assert.deepEqual(first.dns.nameservers, ['192.0.2.53']);
+  assert.equal(first.systemProxy, null, 'no cross-desktop global proxy status is invented');
+  assert.deepEqual(first.tunnelInterfaces, ['wg0']);
+  assert.equal(first.environmentProxy.find(item => item.name === 'HTTPS_PROXY').endpoint, 'http://127.0.0.1:7890');
+  assert.equal(calls, 2); assert.equal(reads, 3); assert.equal(interfacesRead, 1);
+  at = 9999; assert.equal(await sampler.sample(), first); assert.equal(calls, 2);
+  await sampler.sample({ force: true }); assert.equal(calls, 4);
+  assert.ok(!JSON.stringify(first).match(/password|secret|private/));
+});
+
+test('Linux without iproute2 falls back to proc defaults while failed DNS remains unknown', async () => {
+  const sampler = createNetworkDetailsSampler({ platform: 'linux',
+    run: async () => { throw new Error('ip missing'); },
+    readFile: async file => {
+      if (file === '/etc/resolv.conf') throw new Error('permission denied');
+      return file.endsWith('ipv6_route') ? linuxRoute6 : linuxRoute4;
+    },
+    networkInterfaces: () => ({ eth1: [{ family: 'IPv4', address: '198.51.100.2', internal: false }] }), environment: () => ({}),
+  });
+  const result = await sampler.sample();
+  assert.equal(result.interfaceName, 'eth1');
+  assert.equal(result.routes.ipv4.gateway, '198.51.100.1');
+  assert.equal(result.routes.ipv6.interfaceName, 'eth0');
+  assert.equal(result.dns, null);
+  assert.equal(result.systemProxy, null);
+});
+
+const windowsSnapshot = () => ({ routes: [
+  { InterfaceAlias: 'Ethernet 2', InterfaceIndex: 7, DestinationPrefix: '0.0.0.0/0', NextHop: '192.0.2.1', RouteMetric: 10, InterfaceMetric: 80, State: 'Alive' },
+  { InterfaceAlias: 'Wi-Fi', InterfaceIndex: 8, DestinationPrefix: '0.0.0.0/0', NextHop: '198.51.100.1', RouteMetric: 20, InterfaceMetric: 20, State: 'Alive' },
+  { InterfaceAlias: 'broken', DestinationPrefix: '0.0.0.0/0', NextHop: '203.0.113.1', RouteMetric: 1, InterfaceMetric: 1, State: 'Dead' },
+  { InterfaceAlias: 'Wi-Fi', InterfaceIndex: 8, DestinationPrefix: '::/0', NextHop: 'fe80::1%8', RouteMetric: 100, InterfaceMetric: 20, State: 'Alive' },
+], dns: [
+  { InterfaceAlias: 'Ethernet 2', ServerAddresses: ['192.0.2.53'] },
+  { InterfaceAlias: 'Wi-Fi', ServerAddresses: ['198.51.100.53', '2001:db8::53', '198.51.100.53', 'user:password@host'] },
+], proxy: { ProxyEnable: 1, ProxyServer: 'http=user:password@127.0.0.1:7890/private?token=secret;https=127.0.0.1:7890;socks=remote.example:1080',
+  ProxyOverride: 'localhost;<local>;*.example.test;https://user:secret@private.example/path',
+  AutoConfigURL: 'https://user:secret@pac.example/private.pac?key=secret', AutoDetect: 1, Source: 'user' } });
+
+test('Windows current-user proxy configuration redacts all endpoints and distinguishes unknown detection from disabled', () => {
+  const result = parseWindowsSystemProxy(windowsSnapshot().proxy);
+  assert.equal(result.http.endpoint, 'http://127.0.0.1:7890');
+  assert.equal(result.https.endpoint, 'http://127.0.0.1:7890');
+  assert.equal(result.socks.endpoint, 'socks://remote.example:1080');
+  assert.equal(result.autoDiscovery, true);
+  assert.deepEqual(result.pac, { enabled: true, url: 'https://pac.example' });
+  assert.deepEqual(result.bypass, ['localhost', '<local>', '*.example.test']);
+  assert.equal(result.excludeSimpleHostnames, true);
+  assert.equal(result.source, 'windows-user-internet-settings');
+  assert.ok(!JSON.stringify(result).match(/password|secret|private\.example|private\.pac/));
+  const disabled = parseWindowsSystemProxy({ ProxyEnable: 0, ProxyServer: '127.0.0.1:8080', AutoDetect: 0, Source: 'machine' });
+  assert.equal(disabled.http.enabled, false); assert.equal(disabled.autoDiscovery, false);
+  assert.equal(disabled.source, 'windows-machine-internet-settings');
+  const unknown = parseWindowsSystemProxy({});
+  assert.equal(unknown.http.enabled, null); assert.equal(unknown.autoDiscovery, null);
+  assert.equal(parseWindowsSystemProxy(null), null);
+  const common = parseWindowsSystemProxy({ ProxyEnable: 1, ProxyServer: 'proxy.example:3128' });
+  assert.equal(common.http.endpoint, 'http://proxy.example:3128');
+  assert.equal(common.https.endpoint, 'http://proxy.example:3128');
+  assert.equal(common.socks.enabled, false);
+});
+
+test('Windows routes use combined interface and route metrics and DNS follows the selected friendly interface', () => {
+  const result = parseWindowsNetworkConfiguration(JSON.stringify(windowsSnapshot()));
+  assert.equal(result.interfaceName, 'Wi-Fi');
+  assert.deepEqual(result.routes.ipv4, { gateway: '198.51.100.1', interfaceName: 'Wi-Fi' });
+  assert.equal(result.routes.ipv6.gateway, 'fe80::1%8');
+  assert.deepEqual(result.dns.nameservers, ['198.51.100.53', '2001:db8::53']);
+  const explicit = parseWindowsNetworkConfiguration(JSON.stringify(windowsSnapshot()), 'ethernet 2');
+  assert.deepEqual(explicit.dns.nameservers, ['192.0.2.53']);
+  const missingMetrics = windowsSnapshot(); missingMetrics.routes = missingMetrics.routes.map(route => ({ ...route, InterfaceMetric: null }));
+  assert.equal(parseWindowsNetworkConfiguration(JSON.stringify(missingMetrics)).interfaceName, null);
+  assert.equal(parseWindowsNetworkConfiguration(JSON.stringify(missingMetrics)).dns, null);
+  assert.equal(parseWindowsNetworkConfiguration('not JSON'), null);
+  assert.equal(parseWindowsNetworkConfiguration('[]'), null);
+});
+
+test('Windows samples one bounded noninteractive snapshot, supports friendly names, and only probes loopback once', async () => {
+  let at = 0, calls = 0, fail = false;
+  const probes = [], scripts = [];
+  const sampler = createNetworkDetailsSampler({ platform: 'win32', now: () => at,
+    run: async (file, args) => {
+      calls++; scripts.push(args.at(-1));
+      assert.equal(file, 'powershell.exe');
+      assert.deepEqual(args.slice(0, 4), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command']);
+      assert.ok(args.at(-1).includes('Get-NetRoute') && args.at(-1).includes('Get-DnsClientServerAddress'));
+      assert.ok(args.at(-1).includes('ProxySettingsPerUser') && !args.at(-1).includes('netsh winhttp'));
+      if (fail) throw new Error('private snapshot failure');
+      return JSON.stringify(windowsSnapshot());
+    },
+    networkInterfaces: () => ({ 'Wi-Fi': [{ family: 'IPv4', address: '198.51.100.2', internal: false }],
+      'Ethernet 2': [{ family: 'IPv4', address: '192.0.2.2', internal: false }],
+      'WireGuard Tunnel': [{ family: 'IPv4', address: '10.0.0.2', internal: false }] }),
+    environment: () => ({}), probe: async entry => { probes.push(entry); return 'open'; },
+  });
+  const [first, concurrent] = await Promise.all([sampler.sample(), sampler.sample()]);
+  assert.equal(first, concurrent); assert.equal(calls, 1);
+  assert.deepEqual(first.addresses.ipv4, ['198.51.100.2']);
+  assert.deepEqual(first.tunnelInterfaces, ['WireGuard Tunnel']);
+  assert.deepEqual(probes, [{ host: '127.0.0.1', port: 7890, timeoutMs: 250 }]);
+  assert.equal(first.systemProxy.http.probe.status, 'open');
+  assert.equal(first.systemProxy.socks.probe.status, 'unprobed');
+  at = 9999; assert.equal(await sampler.sample(), first); assert.equal(calls, 1);
+  const explicit = await sampler.sample({ interfaceName: 'ethernet 2' });
+  assert.equal(explicit.interfaceName, 'Ethernet 2'); assert.deepEqual(explicit.addresses.ipv4, ['192.0.2.2']);
+  assert.ok(scripts.every(script => !script.includes('ethernet 2')), 'interface names are not interpolated into PowerShell');
+  at = 10000; fail = true;
+  const missing = await sampler.sample();
+  assert.equal(missing.interfaceName, null); assert.equal(missing.dns, null); assert.equal(missing.systemProxy, null);
+  assert.ok(!JSON.stringify(first).match(/password|secret|private\.pac|private snapshot/));
+});
+
+test('oversized and unavailable cross-platform sources do not become successful empty configuration', async () => {
+  assert.equal(parseResolvConf(' '.repeat(256 * 1024 + 1)), null);
+  assert.equal(parseWindowsNetworkConfiguration(' '.repeat(256 * 1024 + 1)), null);
+  const sampler = createNetworkDetailsSampler({ platform: 'linux', run: async () => ' '.repeat(256 * 1024 + 1),
+    readFile: async () => { throw new Error('private read failure'); }, networkInterfaces: () => ({}), environment: () => ({}) });
+  const result = await sampler.sample();
+  assert.deepEqual(result.routes, { ipv4: null, ipv6: null });
+  assert.equal(result.dns, null); assert.equal(result.systemProxy, null);
 });
 
 test('real loopback listener check sends no payload and promptly closes the socket', async t => {

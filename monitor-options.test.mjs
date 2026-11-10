@@ -75,11 +75,11 @@ test('language tokens remain option values and installed-command watch defaults 
 });
 
 test('localized view names preserve stable view keys and legacy Chinese labels', () => {
-  assert.deepEqual(getViewNames('en'), { overview: 'Overview', host: 'Host', tasks: 'Tasks', diagnostics: 'Diagnostics' });
+  assert.deepEqual(getViewNames('en'), { overview: 'Overview', host: 'Host', tasks: 'Tasks', diagnostics: 'Diagnostics', extensions: 'Extensions', running: 'Running' });
   assert.equal(getViewNames('zh-TW').overview, '總覽');
   assert.equal(getViewNames('ja').tasks, 'タスク');
   assert.equal(withLocale('en', () => getViewNames().host), 'Host');
-  assert.deepEqual(VIEW_NAMES, { overview: '总览', host: '主机', tasks: '任务', diagnostics: '诊断' });
+  assert.deepEqual(VIEW_NAMES, { overview: '总览', host: '主机', tasks: '任务', diagnostics: '诊断', extensions: '扩展', running: '运行' });
 });
 
 test('CLI reports unknown flags in a later explicit language before sampling', () => {
@@ -119,6 +119,10 @@ test('the installed one-word command starts watch mode while help, once and JSON
 test('keyboard changes views, pauses and scrolls without mutating input state', () => {
   const state = { view: 'overview', paused: false, leftOffset: 0, windowSeconds: 80 };
   assert.equal(reduceKey(state, '3').view, 'tasks');
+  assert.equal(reduceKey(state, '5').view, 'extensions');
+  assert.equal(reduceKey(state, '6').view, 'running');
+  assert.equal(parseOptions(['--view', 'extensions']).view, 'extensions');
+  assert.equal(parseOptions(['--view', 'running']).view, 'running');
   assert.equal(reduceKey(state, ' ').paused, true);
   assert.equal(reduceKey(state, '\x1b[A').leftOffset, 0);
   assert.equal(reduceKey(state, '\x1b[6~', 30).leftOffset, 30);

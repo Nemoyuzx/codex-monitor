@@ -54,6 +54,33 @@ test('direct disables all implicit proxies, curlrc, redirects and credential out
   assert.doesNotMatch(JSON.stringify(result), /alice|p%40ss|p@ss|secret|private/);
 });
 
+test('Windows invokes curl.exe and preserves case-insensitive process environment without leaking proxy configuration', async () => {
+  const calls = [];
+  const sampler = createNetworkProbeSampler({ platform: 'win32', env: {
+    PATH: 'C:\\fixture\\bin', Path: 'C:\\ignored-duplicate', SystemRoot: 'C:\\Windows',
+    HtTpS_PrOxY: 'http://alice:secret@127.0.0.1:7890', No_PrOxY: '*', SslKeyLogFile: 'C:\\private\\keys',
+  }, run: async (...args) => { calls.push(args); return successfulRun(...args); } });
+  const result = await sampler.sample();
+  assert.equal(calls.length, 4);
+  for (const [file, args, options] of calls) {
+    assert.equal(file, 'curl.exe');
+    assert.equal(options.env.PATH, 'C:\\fixture\\bin');
+    assert.equal(options.env.SYSTEMROOT, 'C:\\Windows');
+    assert.equal(Object.keys(options.env).filter(key => key.toUpperCase() === 'PATH').length, 1);
+    assert.ok(!Object.keys(options.env).some(key => /proxy$|sslkeylogfile/i.test(key)));
+    assert.ok(!args.some(value => /alice|secret/.test(value)));
+    assert.equal(options.input, args[args.indexOf('--proxy') + 1] ? 'proxy-user = "alice:secret"\n' : '');
+  }
+  assert.deepEqual(result.proxies[0].sources, ['environment.HTTPS_PROXY']);
+  assert.equal(result.proxies[0].status, 'ok');
+  assert.doesNotMatch(JSON.stringify(result), /alice|secret|private/);
+  for (const platform of ['linux', 'darwin']) {
+    const executables = [];
+    await createNetworkProbeSampler({ platform, env: {}, run: async (...args) => { executables.push(args[0]); return successfulRun(...args); } }).sample();
+    assert.deepEqual(executables, ['curl', 'curl']);
+  }
+});
+
 test('same HTTP proxy deduplicates system protocols and environment sources; SOCKS uses remote DNS', async () => {
   let calls = 0;
   const result = await createNetworkProbeSampler({ env: { HTTP_PROXY: 'http://localhost:7890', HTTPS_PROXY: 'http://localhost:7890',

@@ -4,9 +4,10 @@ import { buildDashboard, buildDashboardRegions } from './dashboard-model.mjs';
 import { dashboardCatalog } from './locales/dashboard.mjs';
 import { getLocale, withLocale } from './i18n.mjs';
 import { renderResourcePanel, visLen } from './resource-panel.mjs';
+import { renderInformationSections } from './dashboard-layout.mjs';
 
 const locales = ['zh-CN', 'zh-TW', 'en', 'ja'];
-const views = ['overview', 'host', 'tasks', 'diagnostics'];
+const views = ['overview', 'host', 'tasks', 'diagnostics', 'extensions', 'running'];
 const sample = (overrides = {}) => ({
   now: 1_000_000, windowSeconds: 80, width: 100,
   hist: { at: [800_000, 900_000, 1_000_000], cpu: [10, 20, 30], codexCpu: [1, 2, 3], activity: [0, 1, 2] },
@@ -169,5 +170,30 @@ test('localized charts and information stay within terminal cell width', () => {
     const lines = withLocale(locale, () => renderResourcePanel(model, { width, height: 70, color: true }));
     assert.ok(lines.length <= 70, `${locale} ${view} ${width}`);
     assert.ok(lines.every(line => visLen(line) <= width), `${locale} ${view} ${width}`);
+  }
+});
+
+test('complete inventory and running pages localize real row variants and fit both information panes', () => {
+  const inventory = { sampledAt: 900_000, available: true, coverage: { complete: true },
+    mcp: { available: true, total: 1, enabled: 0, disabled: 0, unknown: 1, items: [{ name: 'fixture-mcp', type: 'http', enabled: null, source: 'project' }] },
+    skills: { available: true, total: 1, enabled: 1, disabled: 0, unknown: 0, items: [{ name: 'fixture-skill', description: 'Fixture description', path: '/fixture/a-long-installation-location/example/SKILL.md', enabled: true, source: 'plugin' }] } };
+  const runtime = { sampledAt: 900_000, available: true, complete: true, running: 2, main: 1, agents: 1, stale: 0, rows: [
+    { id: 'main', label: 'main', model: 'fixture-model', isAgent: false, parentId: null, runningMs: 1000, toolsPending: 0, lastActivityAt: 900_000 },
+    { id: 'agent', label: 'agent', model: 'fixture-model', isAgent: true, parentId: 'main', runningMs: 2000, toolsPending: 1, toolsPendingComplete: false, lastActivityAt: 900_000 },
+  ] };
+  for (const locale of locales) for (const view of ['extensions', 'running']) {
+    const options = sample({ locale, view, inventory });
+    options.activity.runtime = runtime;
+    const before = JSON.stringify(options);
+    const { information } = buildDashboardRegions(options);
+    const text = JSON.stringify(information);
+    assert.ok(!/\{[A-Za-z0-9_]+\}/.test(text));
+    if (locale === 'en') assert.ok(!/\p{Script=Han}/u.test(text));
+    for (const width of [36, 73, 120]) for (const pane of ['primary', 'secondary']) {
+      const lines = renderInformationSections(information.filter(section => section.pane === pane), { width, color: true });
+      assert.ok(lines.length, `${view}: ${pane} must have real content`);
+      assert.ok(lines.every(line => visLen(line) <= width), `${locale} ${view} ${pane} ${width}`);
+    }
+    assert.equal(JSON.stringify(options), before);
   }
 });

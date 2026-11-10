@@ -15,12 +15,16 @@ concurrency:
 
 jobs:
   test:
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
         node: ['24', '26']
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -40,5 +44,11 @@ jobs:
       - name: Install command entry
         run: npm link --ignore-scripts
       - name: Command works outside the checkout
+        if: runner.os != 'Windows'
         working-directory: ${{ runner.temp }}
         run: codex-monitor --help
+      - name: Windows command works outside the checkout
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: codex-monitor.cmd --help

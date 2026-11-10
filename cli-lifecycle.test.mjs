@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -22,23 +22,30 @@ async function until(predicate,timeout=12_000){
 }
 async function fixture(callback){
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'codex-monitor-lifecycle-'));
-  const bin=path.join(directory,'bin');fs.mkdirSync(bin);
   const stub=path.join(directory,'host-tool.mjs');
-  fs.writeFileSync(stub,'#!'+process.execPath+'\n'+
-    "import fs from 'node:fs';import path from 'node:path';\n"+
-    "if(path.basename(process.argv[1])==='top'&&process.env.TOP_STARTED){fs.writeFileSync(process.env.TOP_STARTED,String(process.pid));setTimeout(()=>process.exit(0),10000);}else process.exit(0);\n",{mode:0o755});
-  for(const name of ['sysctl','memory_pressure','vm_stat','top','ps','pgrep','ioreg','netstat','scutil','route','ifconfig','pmset','du','df','curl'])fs.symlinkSync(stub,path.join(bin,name));
+  fs.writeFileSync(stub,"import fs from 'node:fs';import path from 'node:path';\n"+
+    "if(path.basename(process.argv[2])==='top'&&process.env.TOP_STARTED){fs.writeFileSync(process.env.TOP_STARTED,String(process.pid));setTimeout(()=>process.exit(0),10000);}else process.exit(0);\n");
+  const bootstrap=path.join(directory,'host-bootstrap.mjs'),stop=path.join(directory,'stop');
+  fs.writeFileSync(bootstrap,[
+    "import cp from 'node:child_process';import fs from 'node:fs';",
+    "import {syncBuiltinESMExports} from 'node:module';",
+    'const execFile=cp.execFile;',
+    "cp.execSync=()=>'';cp.execFileSync=()=>'';",
+    'cp.execFile=(file,args,options,callback)=>execFile(process.execPath,[process.env.CODEX_MONITOR_TEST_STUB,file],options,callback);',
+    'syncBuiltinESMExports();',
+    "if(process.platform==='win32'){const timer=setInterval(()=>{if(fs.existsSync(process.env.CODEX_MONITOR_TEST_STOP)){clearInterval(timer);process.emit('SIGTERM');}},10);timer.unref();}",
+  ].join('\n'));
   let child,closed,stdout='',stderr='',ended=false;
   const start=(extra={})=>{
-    child=spawn(process.execPath,[path.join(root,'bin/codex-monitor.mjs'),'--watch','--json','--no-probes','--lang','en','--metrics-db',path.join(directory,'absent.sqlite')],{
-      cwd:directory,env:{...process.env,CODEX_HOME:directory,PATH:bin,LC_ALL:'C',HTTP_PROXY:'',HTTPS_PROXY:'',ALL_PROXY:'',http_proxy:'',https_proxy:'',all_proxy:'',...extra},stdio:['ignore','pipe','pipe']
+    child=spawn(process.execPath,['--import',pathToFileURL(bootstrap).href,path.join(root,'bin/codex-monitor.mjs'),'--watch','--json','--no-probes','--lang','en','--metrics-db',path.join(directory,'absent.sqlite')],{
+      cwd:directory,env:{...process.env,CODEX_HOME:directory,HOME:directory,USERPROFILE:directory,LC_ALL:'C',CODEX_MONITOR_TEST_STUB:stub,CODEX_MONITOR_TEST_STOP:stop,HTTP_PROXY:'',HTTPS_PROXY:'',ALL_PROXY:'',http_proxy:'',https_proxy:'',all_proxy:'',...extra},stdio:['ignore','pipe','pipe']
     });
     child.stdout.setEncoding('utf8');child.stderr.setEncoding('utf8');
     child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
     closed=new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',(code,signal)=>{ended=true;resolve({code,signal});});});
   };
   const frames=()=>stdout.split('\n').filter(Boolean).flatMap(line=>{try{return [JSON.parse(line)];}catch{return [];}});
-  try{await callback({directory,start,frames,close:()=>closed,kill:()=>child.kill('SIGTERM'),stderr:()=>stderr});}
+  try{await callback({directory,start,frames,close:()=>closed,kill:()=>process.platform==='win32'?fs.writeFileSync(stop,'stop'):child.kill('SIGTERM'),stderr:()=>stderr});}
   finally{
     if(child&&!ended){child.kill('SIGTERM');try{await deadline(closed,1000,'Cleanup timeout');}catch{}if(!ended)child.kill('SIGKILL');await closed;}
     fs.rmSync(directory,{recursive:true,force:true});
@@ -63,7 +70,8 @@ test('watch reconnects when a missing log database is created after startup with
   });
 });
 
-test('SIGTERM interrupts an in-progress top subprocess instead of waiting for its timeout',async()=>{
+test('SIGTERM interrupts an in-progress top subprocess instead of waiting for its timeout',
+  {skip:process.platform!=='darwin'?'Darwin top subprocess lifecycle; Linux/Windows collectors do not launch top':false},async()=>{
   await fixture(async({directory,start,close,kill,stderr})=>{
     const marker=path.join(directory,'top-started');
     start({TOP_STARTED:marker});await until(()=>fs.existsSync(marker));

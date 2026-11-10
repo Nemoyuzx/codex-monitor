@@ -2,9 +2,9 @@
 
 [简体中文](README.md) · [繁體中文](README.zh-TW.md) · [English](README.en.md) · [日本語](README.ja.md)
 
-只读的本地 Codex 终端监控台：主机资源、聊天与工具活动、进程、网络及真实代理出口检测。独立社区项目，与 OpenAI 无官方隶属关系。
+适用于 macOS、Linux、Windows 的只读本地 Codex 终端监控台：主机资源、聊天与工具活动、MCP/Skill 安装清单、运行任务树，以及真实代理出口检测。独立社区项目，与 OpenAI 无官方隶属关系。
 
-Read-only local Codex terminal dashboard for macOS. Live resource charts, activity summaries, and real HTTPS proxy egress checks, with no third-party npm runtime dependencies.
+Read-only local Codex terminal dashboard for macOS, Linux, and Windows. Live resource charts, activity summaries, installed MCP/Skill inventory, running task trees, and real HTTPS proxy egress checks, with no third-party npm runtime dependencies.
 
 ![使用模拟数据的界面预览](docs/preview.svg)
 
@@ -12,7 +12,17 @@ Read-only local Codex terminal dashboard for macOS. Live resource charts, activi
 
 ## 安装与启动
 
-需要 **Node.js 24+**、**macOS** 和 **curl 8.7+**。主机完整采样依赖系统自带的 `sysctl`、`top`、`vm_stat`、`memory_pressure`、`route`、`scutil`、`ioreg`、`pmset` 等工具。其他系统的部分基础指标可能可用，完整支持尚未验证。
+需要 **Node.js 24+** 和 **curl 8.7+**，提供 macOS、Linux、Windows 采集后端。系统工具或权限不可用时，对应指标保持未知，不以零或健康代替。通过 GitHub 地址安装或克隆储存库还需要 Git。
+
+| 平台 | 采集来源与依赖 | 说明 |
+| --- | --- | --- |
+| macOS | 系统自带的 `sysctl`、`top`、`vm_stat`、`memory_pressure`、`route`、`scutil`、`ioreg`、`pmset` 等 | 保留原有主机与代理采集 |
+| Linux | `/proc`、`/sys`、`ps`；有 `ip` 时可用于路由查询 | 不依赖 macOS 工具；没有统一的系统代理来源时显示未知 |
+| Windows | Windows PowerShell 5.1、CIM、`curl.exe` | 从当前用户 Internet Settings 读取代理；受限的 CIM 提供程序或权限会影响可见指标 |
+
+Windows 没有 Unix load average，也不把无法可靠取得的缺页、系统压力等数据伪装成可用。
+
+实际验证已覆盖 macOS 上的 Node.js 24/26，以及 Linux arm64 Docker 容器（官方 `node:24-trixie-slim`、Node.js 24.22.2、curl 8.14.1）内的测试与语法检查；Linux 容器仅跳过 Darwin `top` 专用测试，不等同于原生 Linux 宿主机验证。Windows 已通过解析与命令 fixture 测试，尚未在原生 Windows 实机验证。三平台原生 CI 结果以对应 [GitHub Actions](https://github.com/Nemoyuzx/codex-monitor/actions) 作业为准。
 
 从 GitHub 安装命令：
 
@@ -30,17 +40,28 @@ npm link --ignore-scripts
 codex-monitor
 ```
 
+Windows PowerShell 可使用 npm 生成的 `.cmd` 入口，避免脚本执行策略拦截 `.ps1`：
+
+```powershell
+npm.cmd install --global git+https://github.com/Nemoyuzx/codex-monitor.git
+codex-monitor.cmd
+```
+
+Windows 克隆后的本机链接使用 `npm.cmd link --ignore-scripts`；也可直接执行 `node codex-status.mjs -w`，不需要修改 PowerShell 执行策略。
+
 安装后可在任意目录直接输入 `codex-monitor`，默认进入每秒刷新的交互模式。无需每次切换到项目目录。
 
 ```sh
 codex-monitor -i 3                  # 每 3 秒刷新
 codex-monitor --view diagnostics    # 诊断页
+codex-monitor --view extensions     # MCP / Skill 安装清单
+codex-monitor --view running        # 运行任务与子代理
 codex-monitor --once                # 单次文字输出
 codex-monitor --json --no-probes    # 单次 JSON，不访问外部探针
 codex-monitor -w --json              # 持续 JSONL
 ```
 
-开发测试另外需要 `openssl`、本地回环端口监听权限。所有测试使用临时文件、内存数据库或本机服务，不要求 Codex 账号，也不依赖公网。Node 24/26 的自动测试见 [GitHub Actions](https://github.com/Nemoyuzx/codex-monitor/actions)。
+开发测试另外需要 `openssl`、本地回环端口监听权限。所有测试使用临时文件、内存数据库或本机服务，不要求 Codex 账号，也不依赖公网。macOS/Linux/Windows 与 Node 24/26 的 CI 矩阵见 [GitHub Actions](https://github.com/Nemoyuzx/codex-monitor/actions)。
 
 当前版本还没有独立桌面应用；命令需要终端和 Node.js 运行时。SQLite 数据结构属于 Codex 内部实现，后续版本可能变化，无法读取的字段会显示未知。
 
@@ -70,17 +91,17 @@ codex-monitor --help --lang en            # 英语帮助
     node codex-status.mjs --no-color   # 关闭颜色
     node codex-status.mjs -w --view tasks       # 从任务页启动
     node codex-status.mjs -w --window 300       # 最近 5 分钟趋势
-    node codex-status.mjs -w --interface en0   # 固定网络接口
+    node codex-status.mjs -w --interface en0   # 固定网络接口（macOS 示例）
     node codex-status.mjs --json --no-probes   # JSON 快照，关闭全部外部探针
     node codex-status.mjs -w --json           # 持续输出 JSONL
 
-实时模式参考 nvitop 的终端布局，提供总览、主机、任务、诊断四页。右侧展示 8 张主机/Codex 趋势图，以及逐核 CPU、电源和系统压力；任务、进程、工具、网络配置、告警和性能详情都在左侧。终端达到 180 列时，左侧自动分成两栏，头部固定、两栏正文同步滚动。宽屏右栏约占 40%，其余宽度留给左侧信息。
+实时模式参考 nvitop 的终端布局，提供总览、主机、任务、诊断、扩展清单、运行任务六页。右侧展示 8 张主机/Codex 趋势图，以及逐核 CPU、电源和系统压力；任务、进程、工具、网络配置、告警和性能详情都在左侧。终端达到 180 列时，左侧自动分成两栏，头部固定、两栏正文同步滚动。宽屏右栏约占 40%，其余宽度留给左侧信息。
 
 - 图表占满可用宽度，最新采样位于最右侧；缺失或尚未采集的数据留空。
 - 图表按可用高度放大，不再为文字列表压缩；右侧会为逐核状态留出空间。较矮窗口优先省略辅助文字、再缩小图高。
 - 默认时间窗口为最近 80 秒；`-i 3` 时为最近 4 分钟，横轴按实际采样时间绘制。
-- 物理内存固定为 0–100%，与 `memory_pressure` 的估计明确区分；全机/逐核 CPU 使用累计时间差分，Codex CPU 为 `ps %CPU`（单核 100%）。
-- 默认网络接口跟随系统默认路由，分别展示上传/下载。块设备 IO 包含挂载镜像，不声称仅统计物理硬盘。
+- 物理内存固定为 0–100%，与系统压力估计明确区分；全机/逐核 CPU 使用累计时间差分。Codex CPU 在 macOS/Linux 使用 `ps %CPU`，Windows 使用进程累计 CPU 时间差分；单核满载均为 100%，Windows 首次采样没有差分时显示未知。
+- 默认网络接口跟随系统默认路由，分别展示上传/下载。存储 I/O 按各平台可确认的设备来源统计；macOS 可包含挂载镜像，不声称仅统计物理硬盘。
 - 终端宽度不足 180 列时，左侧合并为单栏；不足 84 列时隐藏右侧图表，8 项资源当前值仍在文字详情中可见。实时刷新为底部提示保留空间。
 - `--window` 支持 10–3600 秒，`--threads` 支持 1–30 个表格条目，均不限制后台统计只扫描所显示的聊天。
 
@@ -89,6 +110,7 @@ codex-monitor --help --lang en            # 英语帮助
 | 按键 | 操作 |
 | --- | --- |
 | `1` / `2` / `3` / `4` | 总览 / 主机 / 任务 / 诊断 |
+| `5` / `6` | MCP 与 Skill 安装清单 / 运行任务与子代理 |
 | 空格 / `p` | 暂停或恢复采样，暂停期间保留当前画面 |
 | `↑` / `↓`、`k` / `j` | 滚动左侧完整内容，宽屏两栏同步滚动 |
 | `PgUp` / `PgDn`、`g` / `Home` | 翻页、回到顶部 |
@@ -100,6 +122,13 @@ codex-monitor --help --lang en            # 英语帮助
 可选：用 CODEX_HOME 指定数据目录（默认 ~/.codex）。
 
     CODEX_HOME=/path/to/.codex node codex-status.mjs -w
+
+Windows PowerShell 设置数据目录：
+
+```powershell
+$env:CODEX_HOME = Join-Path $HOME ".codex"
+codex-monitor.cmd --view extensions
+```
 
 ## 监控维度
 
@@ -113,13 +142,22 @@ codex-monitor --help --lang en            # 英语帮助
 右侧趋势图和左侧详情包括：
 
 - 主机：全机与逐核 CPU、物理内存、内存压力估计、默认接口的分方向流量、块设备读写和 IOPS、缺页、swap、电池和系统压力；图表可显示窗口内 min/max/avg。
-- Codex：按进程树归集 CPU/RSS，识别桌面端、app-server、exec-server、code-mode、可辨 MCP 和工作进程，显示 CPU 排行；不把进程命令参数中出现的“codex”当成 Codex 工作进程。RSS 求和含共享页重复。
+- Codex：按进程树归集 CPU/RSS，识别桌面端、app-server、exec-server、code-mode、可辨 MCP 和工作进程，显示 CPU 排行；不把进程命令参数中出现的“codex”当成 Codex 工作进程。Windows 的 RSS 栏使用 WorkingSetSize；内存求和含共享页重复。
 - 任务：主聊天/子代理、模型、运行时长、最近活动、历史遗留 turn、排队数量与最长等待、真正 active 的目标数。
 - 工具：近 10 分钟/1 小时完成和失败数量、工具类型、执行中项、P50/P95 耗时。完成速率按真实完成时间归窗，显示 10 分钟平均；失败也计入总完成量。
 - 诊断：HTTP 状态与响应头延迟、ERROR/WARN 每分钟均值、logger target 摘要、DB/WAL 大小、磁盘剩余、采集耗时与来源可用性。HTTP 401/403 等响应只证明链路可达，不验证登录或服务可用性；MCP 数量本身不再被当成泄漏证据。
 - 网络配置：所选接口的本机 IPv4/IPv6、IPv4/IPv6 默认网关、系统 DNS、HTTP/HTTPS/SOCKS 代理、PAC、自动发现和绕过规则、当前进程代理环境变量、检测到的隧道接口。总览显示简要配置，诊断页显示完整详情；不将隧道接口的存在视为 VPN 已接管流量。
 - 出口实测：直连及各条显式代理的公网 IP、实际 HTTPS 连通性、HTTP 状态和请求耗时。认证失败、TCP/DNS/代理握手/TLS/超时等分别显示；部分目标可达会明确标注。按 `4` 查看阶段耗时和路径验证详情。
 - Token：数据库累计计数、本次监控期间的计数增量。它们不代表模型生成速度。
+
+## 安装清单与运行任务
+
+- 总览显示已发现的 Skill 数量，并区分安装数量、启用状态和无法确认的状态。按 `5` 或使用 `--view extensions` 查看 MCP 名称、配置类型/来源，以及 Skill 名称、描述、来源与本地路径。已配置 MCP 不等于正在运行的 MCP 子进程；已安装 Skill 也不等于当前会话已加载。清单反映本机可读配置；项目配置需要信任证据，不能据此断言当前会话最终生效的完整集合。
+- Skill 发现是本地、有界的只读扫描，按 `SKILL.md` 真实路径去重，同名但路径不同的安装分别保留；清单不包含 Skill 正文。扫描范围：包括当前目录到仓库根的 `.agents/skills`、用户 `~/.agents/skills`、非 Windows 系统存在时的 `/etc/codex/skills`，以及兼容的 `$CODEX_HOME/skills`（含 `.system`）。插件技能仅纳入有明确安装标记或显式配置的来源，缓存残留不作为安装证据；`[[skills.config]]` 的禁用设置会覆盖启用状态，证据不足时显示未知。
+- MCP 清单来自 `$CODEX_HOME/config.toml`、有明确信任证据的项目 `.codex/config.toml`，以及启用状态明确的插件清单；只输出名称、类型、来源和启用状态，不输出 URL、命令参数、环境变量值或认证头。清单缓存 15 秒，来源不完整会提示，`r` 可强制刷新。
+- 按 `6` 或使用 `--view running` 查看近期 `inProgress` 主任务与子代理、父子关系、运行时长、模型、最近活动和待完成工具。陈旧记录单独计数，不混入正在运行的列表；父记录缺失或关系不完整时明确显示，不能伪造层级。
+- 运行页不被 `--threads` 的显示条数截断，但仍受后台有界采样限制；覆盖不完整时会说明。它显示本地投影快照，不代表服务端全量实时任务状态。`r` 会刷新安装清单和采集结果。
+- 新页沿用自适应布局：能完整放入两组就均分并排，长内容独占整行；列表可滚动查看，不为并排而截断地址、任务名或说明。
 
 ## 可选原生性能快照
 
@@ -147,11 +185,11 @@ codex-monitor --help --lang en            # 英语帮助
 - 四个应用 HTTP 探针在后台运行并缓存 10 秒；公网与代理 HTTPS 实测缓存 60 秒，1s 刷新不会每个 tick 重发请求。
 - 网络配置缓存 10 秒，`r` 可强制刷新。配置采样保留本机代理端口的 TCP 监听状态，实际代理可用性由独立 HTTPS 实测确定；系统配置、监听状态或独立探针不等同于 Codex 应用自身的请求路径。
 - 代理环境变量和 PAC 地址仅显示协议、主机和端口，不显示认证信息、路径或查询参数。`NO_PROXY` 仅显示绕过规则数量。
-- 数据目录大小 du 只算一次；进程信息每个 tick 只跑一次 ps 全量采集。
+- 目录大小、进程及系统查询按平台执行并复用采样结果；缺少工具或权限不足时保留未知。
 - 每 5 秒重新检查数据库来源，启动后新建的库、版本轮换和文件替换可自动接入；按 `r` 会立即重新发现并重新读取配置。连接始终只读，源不可用时保持空值。
 - 活动统计在单次采样内复用 SQL statement；表结构变化会失效列缓存。近期 turn 查询可利用源库已有时间索引，不向源库创建索引。
 - 默认网卡独立按 1 秒缓存跟随路由；无法确认默认出口时保持未知，不按累计流量猜测。探针运行期间的刷新请求合并为一个后续请求。
-- 退出会取消尚未完成的 `top` 采样；缺失、重置或更换来源的速率基线不会伪装成零速率。任务名称中的复合 emoji 按完整字符截断和换行。
+- 退出会取消尚未完成的系统采样；缺失、重置或更换来源的速率基线不会伪装成零速率。任务名称中的复合 emoji 按完整字符截断和换行。
 - 时间戳单位不同已各自换算：threads.updated_at_ms / thread_items.*_at_ms 是毫秒，thread_turns.started_at / logs.ts 是秒。
 - 工具统计覆盖近一小时更新的聊天和全部候选进行中 turn，最多 256 个聊天、每聊天 10000 条投影；耗时分位取最多 2000 个有真实耗时的已采样工具。查询至少缓存 5 秒，达到上限会显示“有界采样”及 `≥`，不能据此声称全量无异常。
 - SQL 查询失败或数据源缺失会显示不可用和空值，不将读取失败当作零占用、零告警或健康。历史未完成项独立列出，不能仅凭“超过 1 小时”断言已停止。
@@ -167,7 +205,7 @@ npm test
 
 ## 隐私与分享
 
-终端页面会显示本机会话片段；JSON 虽然省略消息和命令正文，仍含聊天标题/昵称、UUID、模型、IP 和代理端点等元数据。分享截图或导出文件前请检查并脱敏。不要提交实际 Codex 数据库、认证文件、真实聊天截图或网络抓包。
+终端页面会显示本机会话片段；JSON 虽然省略消息和命令正文，仍含聊天标题/昵称、UUID、模型、IP、代理端点，以及 MCP/Skill 名称和本地来源路径等元数据。分享截图或导出文件前请检查并脱敏。不要提交实际 Codex 数据库、认证文件、真实聊天截图或网络抓包。
 
 ## 贡献与许可证
 
